@@ -1,199 +1,323 @@
-# 시나리오 2: Pod 스케줄링 흐름
+# Scenario 2: Pod Scheduling Flow
 
-Pending Pod가 생성된 후 스케줄러가 감지하고 노드를 선택하여 바인딩하기까지의 전체 흐름을 추적합니다.
+Traces the full flow from the creation of a Pending Pod through the scheduler detecting it, selecting a node, and binding it.
 
-## 전체 흐름도
+## Big Picture
+
+Scheduling is a two-phase decision process. The scheduling cycle computes a best node using plugin-driven filtering and scoring, and the binding cycle commits that decision back to the API server. The scheduler keeps these phases separate so expensive selection logic can stay deterministic while API write/backoff handling remains isolated.
+
+## Interface Resolution Guide (This Scenario)
+
+Scheduler code is heavily interface-based (`framework.Framework`, plugin extension points). Use this order:
+1. Start from the extension-point interface.
+2. Jump to compile-time assertions (`var _ framework.X = &Y{}`).
+3. Follow framework/plugin constructors that return interfaces.
+4. Verify runtime dispatch at profile selection and plugin execution sites.
+
+### Worked Example: `framework.Framework` -> `*frameworkImpl`
+
+This scenario crosses this interface on nearly every scheduling call:
+
+1. Interface: `type Framework interface` in [../pkg/scheduler/framework/interface.go](../pkg/scheduler/framework/interface.go#L200).
+2. Compile-time proof: `var _ framework.Framework = &frameworkImpl{}` in [../pkg/scheduler/framework/runtime/framework.go](../pkg/scheduler/framework/runtime/framework.go#L321).
+3. Factory that hides the type: `NewFramework(...) (framework.Framework, error)` in [../pkg/scheduler/framework/runtime/framework.go](../pkg/scheduler/framework/runtime/framework.go#L328).
+4. DI wiring: profile construction stores the returned interface value in `profile.Map` during scheduler startup in [../pkg/scheduler/scheduler.go](../pkg/scheduler/scheduler.go#L362).
+5. Runtime selection: `frameworkForPod` resolves `Profiles[pod.Spec.SchedulerName]` in [../pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L533), so each later `fwk.RunFilterPlugins(...)` call executes on a `*frameworkImpl`.
+
+## Reading Guide (Beginner)
+
+- **Trigger:** a Pending Pod appears in the scheduler queue from informer events.
+- **Two different outputs:** scheduling cycle chooses a node; binding cycle writes that choice to the API server.
+- **Why retries happen:** cache assumptions and API writes are decoupled, so failures requeue Pods for another pass.
+- **Success criterion for this scenario:** `pod.spec.nodeName` is set and `PodScheduled=True`.
+- **Most common confusion:** scheduling success does not start containers; kubelet execution is a separate scenario.
+
+## Overall Flow Diagram
 
 ```
-etcd에 Pending Pod 저장
-        │ (Watch 이벤트)
+Pending Pod stored in etcd
+        │ (Watch event)
         ▼
 [1] pkg/scheduler/backend/queue/scheduling_queue.go
-    PriorityQueue.Add() — activeQ에 추가
+    PriorityQueue.Add() — add to activeQ
         │
         ▼
 [2] pkg/scheduler/schedule_one.go:ScheduleOne()
-    activeQ에서 Pod 추출 → scheduleOnePod()
+    Pop Pod from activeQ → scheduleOnePod()
         │
         ├─ [3] schedulingCycle()
         │       │
         │       ├─ [3a] RunPreFilterPlugins()
-        │       │         Pod 레벨 사전 검증
+        │       │         Pod-level pre-validation
         │       │
         │       ├─ [3b] findNodesThatPassFilters()
-        │       │         병렬 Filter 플러그인 실행
-        │       │         → 가능한 노드 목록
+        │       │         Run Filter plugins in parallel
+        │       │         → list of feasible nodes
         │       │
         │       ├─ [3c] prioritizeNodes()
         │       │         PreScore → Score → NormalizeScore
-        │       │         → 노드별 점수
+        │       │         → per-node scores
         │       │
         │       ├─ [3d] selectHost()
-        │       │         최고점 노드 선택
+        │       │         Select highest-scoring node
         │       │
         │       └─ [3e] assumeAndReserve()
-        │                 Cache에 예약 + Reserve 플러그인
+        │                 Reserve in Cache + Reserve plugins
         │
-        └─ [4] runBindingCycle() (비동기 goroutine)
+        └─ [4] runBindingCycle() (async goroutine)
                 │
-                ├─ RunPermitPlugins() — 허가 확인
-                ├─ RunPreBindPlugins() — 바인딩 전 처리
-                ├─ bind() — API 서버에 nodeName 설정
+                ├─ RunPermitPlugins() — permit check
+                ├─ RunPreBindPlugins() — pre-bind processing
+                ├─ bind() — set nodeName on API server
                 └─ RunPostBindPlugins()
 ```
 
 ---
 
-## 단계별 상세 분석
+## Step-by-Step Detailed Analysis
 
-### 스케줄러 구조체
+### Scheduler Struct
 
-**파일:** [pkg/scheduler/scheduler.go](../pkg/scheduler/scheduler.go#L68)
+**File:** [pkg/scheduler/scheduler.go](../pkg/scheduler/scheduler.go#L68)
 
 ```go
-// 라인 68-125: Scheduler struct
+// Lines 68-125: Scheduler struct
 type Scheduler struct {
-    Cache           internalcache.Cache              // 노드/Pod 인메모리 캐시
-    NextPod         func(...) (*framework.QueuedPodInfo, error)  // activeQ에서 Pop
-    SchedulingQueue internalqueue.SchedulingQueue    // 3-tier 우선순위 큐
-    SchedulePod     func(...)                        // Filter + Score 로직
-    Profiles        profile.Map                      // 스케줄러 프로필 (플러그인 설정)
-    APIDispatcher   *apidispatcher.APIDispatcher     // 비동기 API 호출
+    Cache           internalcache.Cache              // in-memory node/Pod cache
+    NextPod         func(...) (*framework.QueuedPodInfo, error)  // Pop from activeQ
+    SchedulingQueue internalqueue.SchedulingQueue    // 3-tier priority queue
+    SchedulePod     func(...)                        // Filter + Score logic
+    Profiles        profile.Map                      // scheduler profiles (plugin configuration)
+    APIDispatcher   *apidispatcher.APIDispatcher     // asynchronous API calls
 }
 ```
 
+> ⚠️ **Where does the concrete `Framework` come from?** `Profiles` is `profile.Map`, i.e. `map[string]framework.Framework` ([profile.go:46](../pkg/scheduler/profile/profile.go#L46)) — a map of *interface* values, so the struct behind it is not obvious. Because Go uses implicit interface satisfaction, trace it like this:
+>
+> 1. **Interface:** `type Framework interface` — [framework/interface.go:200](../pkg/scheduler/framework/interface.go#L200)
+> 2. **Concrete struct:** `frameworkImpl` — [framework/runtime/framework.go:58](../pkg/scheduler/framework/runtime/framework.go#L58)
+> 3. **Compile-time proof:** `var _ framework.Framework = &frameworkImpl{}` — [framework.go:321](../pkg/scheduler/framework/runtime/framework.go#L321) (the highest-signal line: it names both interface and struct)
+> 4. **Factory (hides the type):** `NewFramework(...) (framework.Framework, error)` — [framework.go:328](../pkg/scheduler/framework/runtime/framework.go#L328)
+> 5. **DI wiring:** `profile.NewMap` stores one `frameworkImpl` per profile — [scheduler.go:362](../pkg/scheduler/scheduler.go#L362)
+> 6. **Runtime selection:** `Profiles[pod.Spec.SchedulerName]` picks the concrete value per Pod — [schedule_one.go:533](../pkg/scheduler/schedule_one.go#L533) (in `frameworkForPod`)
+>
+> So every `fwk framework.Framework` parameter you see below is really a `*frameworkImpl`.
+
 ---
 
-### [1] 스케줄링 큐
+### [1] Scheduling Queue
 
-**파일:** [pkg/scheduler/backend/queue/scheduling_queue.go](../pkg/scheduler/backend/queue/scheduling_queue.go#L170)
+**File:** [pkg/scheduler/backend/queue/scheduling_queue.go](../pkg/scheduler/backend/queue/scheduling_queue.go#L170)
 
 ```go
-// 라인 170-215: PriorityQueue struct
+// Lines 170-215: PriorityQueue struct
 type PriorityQueue struct {
-    activeQ             activeQueuer        // 스케줄링 대상 (힙)
-    backoffQ            backoffQueuer       // 백오프 중인 Pod (지수 백오프)
-    unschedulablePods   *unschedulablePods  // 스케줄 불가 Pod (최대 5분)
+    activeQ             activeQueuer        // pods to schedule (heap)
+    backoffQ            backoffQueuer       // Pods in backoff (exponential backoff)
+    unschedulablePods   *unschedulablePods  // unschedulable Pods (max 5 minutes)
     podMaxInUnschedulablePodsDuration time.Duration
     clock               clock.WithTicker
     lock                sync.RWMutex
 }
 ```
 
-**큐 상태 전이:**
+**Queue state transitions:**
 ```
-신규 Pod → activeQ
-                │ 스케줄 실패
+New Pod → activeQ
+                │ scheduling failure
                 ├─ (unschedulable plugin) → unschedulablePods
-                │                              │ 5분 경과 or 클러스터 이벤트
-                └─ (기타)        → backoffQ   │
-                                    │ 백오프 만료└──→ activeQ
+                │                              │ 5 min elapsed or cluster event
+                └─ (other)       → backoffQ   │
+                                    │ backoff expired└──→ activeQ
                                     └──────────────→ activeQ
 ```
 
-**QueuedPodInfo 구조:**
+**QueuedPodInfo structure:**
 ```go
 type QueuedPodInfo struct {
     PodInfo                *PodInfo
     Pod                    *v1.Pod
     Timestamp              time.Time
-    Attempts               int                  // 시도 횟수
-    UnschedulablePlugins   sets.Set[string]     // 실패한 플러그인
+    Attempts               int                  // number of attempts
+    UnschedulablePlugins   sets.Set[string]     // plugins that failed
     BackoffExpiration      time.Time
     InitialAttemptTimestamp *time.Time
 }
 ```
 
-**주요 함수:**
+**Key functions:**
 
-| 함수 | 라인 | 역할 |
+| Function | Line | Role |
 |------|------|------|
-| `Add(ctx, pod)` | 728 | activeQ에 Pod 추가 (PreEnqueue 플러그인 실행) |
-| `Pop(logger)` | 945 | activeQ에서 다음 Pod 추출 |
-| `Activate()` | 744 | unschedulable/backoff → activeQ 이동 |
-| `MoveAllToActiveOrBackoffQueue()` | 129 | 클러스터 이벤트 시 재큐잉 |
-| `AddUnschedulableIfNotPresent()` | - | 실패한 Pod 재큐잉 |
+| `Add(ctx, pod)` | 728 | Add Pod to activeQ (runs PreEnqueue plugins) |
+| `Pop(logger)` | 945 | Pop next Pod from activeQ |
+| `Activate()` | 744 | Move unschedulable/backoff → activeQ |
+| `MoveAllToActiveOrBackoffQueue()` | 129 | Requeue on cluster events |
+| `AddUnschedulableIfNotPresent()` | - | Requeue failed Pods |
 
 ---
 
-### [2] 스케줄링 메인 루프
+### [Framework] How Plugins Are Wired into `frameworkImpl`
 
-**파일:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L67)
+Every `fwk.RunXxxPlugins(...)` call you see in the scheduling cycle dispatches to a concrete plugin slice inside `frameworkImpl`. Understanding the wiring from plugin registration to those slices is essential before reading the Filter/Score sections.
+
+**`frameworkImpl` holds one slice per extension point (runtime/framework.go:58):**
 
 ```go
-// 라인 67-96: ScheduleOne()
+type frameworkImpl struct {
+    preFilterPlugins  []framework.PreFilterPlugin
+    filterPlugins     []framework.FilterPlugin
+    postFilterPlugins []framework.PostFilterPlugin
+    preScorePlugins   []framework.PreScorePlugin
+    scorePlugins      []framework.ScorePlugin
+    reservePlugins    []framework.ReservePlugin
+    preBindPlugins    []framework.PreBindPlugin
+    bindPlugins       []framework.BindPlugin
+    postBindPlugins   []framework.PostBindPlugin
+    permitPlugins     []framework.PermitPlugin
+    preEnqueuePlugins []framework.PreEnqueuePlugin
+    queueSortPlugins  []framework.QueueSortPlugin
+    // ... plus placement/score variant slices
+
+    pluginsMap        map[string]fwk.Plugin  // all plugins by name
+}
+```
+
+**`getExtensionPoints()` maps config → slice pointer (runtime/framework.go):**
+
+```go
+func (f *frameworkImpl) getExtensionPoints(plugins *config.Plugins) []extensionPoint {
+    return []extensionPoint{
+        {&plugins.PreFilter, &f.preFilterPlugins},
+        {&plugins.Filter,    &f.filterPlugins},
+        {&plugins.Score,     &f.scorePlugins},
+        {&plugins.Bind,      &f.bindPlugins},
+        // ... one entry per extension point
+    }
+}
+```
+
+During `NewFramework(...)`, a single loop calls `getExtensionPoints`, then for each configured plugin name, does a type-assertion against the target interface and appends the concrete value to the slice:
+
+```go
+// Simplified from NewFramework() (framework.go:328)
+for _, ep := range f.getExtensionPoints(plugins) {
+    for _, pg := range *ep.plugins {
+        p := f.pluginsMap[pg.Name]  // concrete Plugin already constructed
+        if iface, ok := p.(FilterPlugin); ok {  // interface assertion
+            *ep.slicePtr = append(*ep.slicePtr, iface)
+        }
+    }
+}
+```
+
+A plugin that implements multiple interfaces (e.g. `NodeAffinity` implements both `PreFilterPlugin` and `FilterPlugin`) ends up in **multiple** slices.
+
+**Compile-time interface proofs for built-in plugins:**
+
+| Plugin | Interfaces | Assertion location |
+|--------|-----------|-------------------|
+| `NodeAffinity` | PreFilter, Filter, Score | [nodeaffinity.go](../pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go) |
+| `TaintToleration` | Filter, PreScore, Score | [taint_toleration.go](../pkg/scheduler/framework/plugins/tainttoleration/taint_toleration.go) |
+| `DefaultBinder` | Bind | [binder.go](../pkg/scheduler/framework/plugins/defaultbinder/default_binder.go) |
+| `DefaultPreemption` | PostFilter | [default_preemption.go](../pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.go) |
+
+**Runtime dispatch:**
+
+```go
+// RunFilterPlugins iterates the slice; any Unschedulable status short-circuits
+func (f *frameworkImpl) RunFilterPlugins(ctx, state, pod, nodeInfo) {
+    for _, pl := range f.filterPlugins {
+        status := pl.Filter(ctx, state, pod, nodeInfo)
+        if !status.IsSuccess() {
+            return status  // first failure stops the chain for this node
+        }
+    }
+}
+```
+
+Score plugins use the same pattern but collect all scores into `NodePluginScores` (one entry per node per plugin) before NormalizeScore and weight multiplication.
+
+---
+
+### [2] Scheduling Main Loop
+
+**File:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L67)
+
+```go
+// Lines 67-96: ScheduleOne()
 func (sched *Scheduler) ScheduleOne(ctx context.Context) {
     podInfo := sched.NextPod(logger)  // activeQ.Pop()
     sched.scheduleOnePod(ctx, podInfo)
 }
 
-// 라인 99-148: scheduleOnePod()
+// Lines 99-148: scheduleOnePod()
 func (sched *Scheduler) scheduleOnePod(ctx context.Context, podInfo *framework.QueuedPodInfo) {
 
-    // 라인 127: 사이클 상태 초기화 (플러그인 간 데이터 공유)
+    // Line 127: initialize cycle state (data sharing between plugins)
     state := framework.NewCycleState()
 
-    // 라인 140: 스케줄링 사이클 (동기)
+    // Line 140: scheduling cycle (synchronous)
     scheduleResult, assumedPodInfo, status := sched.schedulingCycle(ctx, state, ...)
 
-    // 라인 147: 바인딩 사이클 (비동기 goroutine)
+    // Line 147: binding cycle (async goroutine)
     go sched.runBindingCycle(ctx, state, ...)
 }
 ```
 
 ---
 
-### [3] 스케줄링 사이클
+### [3] Scheduling Cycle
 
-**파일:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L175)
+**File:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L175)
 
 ```go
-// 라인 175-252: schedulingCycle()
+// Lines 175-252: schedulingCycle()
 func schedulingCycle(ctx, state, fwk, podInfo, ...) {
 
-    // 1. NodeInfo 스냅샷 갱신 (라인 183)
+    // 1. Refresh NodeInfo snapshot (line 183)
     sched.Cache.UpdateSnapshot(logger, sched.nodeInfoSnapshot)
 
-    // 2. Filter + Score (라인 193)
+    // 2. Filter + Score (line 193)
     scheduleResult, err := sched.SchedulePod(ctx, fwk, state, assumedPodInfo.Pod)
 
-    // 3. 실패 시 PostFilter (프리엠션, 라인 200)
+    // 3. PostFilter on failure (preemption, line 200)
     if err != nil {
         fwk.RunPostFilterPlugins(ctx, state, pod, diagnosis.NodeToStatus)
     }
 
-    // 4. Assume + Reserve (라인 230)
+    // 4. Assume + Reserve (line 230)
     assumeAndReserve(ctx, state, fwk, podInfo, ...)
 }
 ```
 
-#### [3a] PreFilter 플러그인
+#### [3a] PreFilter Plugins
 
-**파일:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L628)
+**File:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L628)
 
 ```go
-// 라인 628-718: findNodesThatFitPod()
+// Lines 628-718: findNodesThatFitPod()
 preFilterResult, preFilterStatus, preFilterStatusMap :=
     fwk.RunPreFilterPlugins(ctx, state, pod)
 ```
 
-**PreFilter 플러그인 예시:**
+**Example PreFilter plugins:**
 
-| 플러그인 | 파일 | 역할 |
+| Plugin | File | Role |
 |---------|------|------|
-| NodePorts | [pkg/scheduler/framework/plugins/nodeports/node_ports.go](../pkg/scheduler/framework/plugins/nodeports/node_ports.go#L73) | Pod의 포트 요구사항 캐싱 |
-| NodeAffinity | [pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go](../pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go#L148) | 노드 친화성 규칙 파싱 |
-| VolumeBinding | pkg/scheduler/framework/plugins/volumebinding/ | PVC 바인딩 가능성 사전 계산 |
+| NodePorts | [pkg/scheduler/framework/plugins/nodeports/node_ports.go](../pkg/scheduler/framework/plugins/nodeports/node_ports.go#L73) | Cache the Pod's port requirements |
+| NodeAffinity | [pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go](../pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go#L148) | Parse node affinity rules |
+| VolumeBinding | pkg/scheduler/framework/plugins/volumebinding/ | Pre-compute PVC binding feasibility |
 
-#### [3b] Filter 플러그인 (병렬 실행)
+#### [3b] Filter Plugins (Parallel Execution)
 
-**파일:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L777)
+**File:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L777)
 
 ```go
-// 라인 777-860: findNodesThatPassFilters()
+// Lines 777-860: findNodesThatPassFilters()
 func findNodesThatPassFilters(ctx, fwk, state, pod, diagnosis, nodes) {
 
-    // 병렬 처리 (라인 801-846)
+    // Parallel processing (lines 801-846)
     fwk.Parallelizer().Until(ctx, len(nodes), func(i int) {
         nodeInfo := nodes[i]
         status := fwk.RunFilterPluginsWithNominatedPods(ctx, state, pod, nodeInfo)
@@ -202,241 +326,264 @@ func findNodesThatPassFilters(ctx, fwk, state, pod, diagnosis, nodes) {
         }
     }, metrics.Filter)
 
-    // 설정된 수 달성 시 조기 종료
+    // Early exit once the configured count is reached
 }
 ```
 
-**percentageOfNodesToScore:** 클러스터 크기에 따라 평가할 노드 비율 조정
-- 노드 100개 이하: 100%
-- 노드 5000개: 약 10%
-- 최소: 5%
+**percentageOfNodesToScore:** adjusts the fraction of nodes evaluated based on cluster size
+- 100 nodes or fewer: 100%
+- 5000 nodes: about 10%
+- Minimum: 5%
 
-**주요 Filter 플러그인:**
+**Key Filter plugins:**
 
-| 플러그인 | 역할 |
+| Plugin | Role |
 |---------|------|
-| NodeUnschedulable | `spec.unschedulable` 확인 |
-| NodeName | `spec.nodeName` 지정 확인 |
-| NodePorts | 포트 충돌 확인 |
-| NodeAffinity | node affinity/anti-affinity 검사 |
-| TaintToleration | taint/toleration 매칭 |
-| NodeResourcesFit | CPU/Memory/GPU 자원 확인 |
-| VolumeBinding | PVC 볼륨 연결 가능성 |
-| InterPodAffinity | Pod 간 친화성/반친화성 |
-| PodTopologySpread | 토폴로지 분산 제약 |
+| NodeUnschedulable | Check `spec.unschedulable` |
+| NodeName | Check the `spec.nodeName` assignment |
+| NodePorts | Check for port conflicts |
+| NodeAffinity | Check node affinity/anti-affinity |
+| TaintToleration | Match taints/tolerations |
+| NodeResourcesFit | Check CPU/Memory/GPU resources |
+| VolumeBinding | PVC volume attachability |
+| InterPodAffinity | Inter-Pod affinity/anti-affinity |
+| PodTopologySpread | Topology spread constraints |
 
-#### [3c] Score 플러그인
+#### [3c] Score Plugins
 
-**파일:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L943)
+**File:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L943)
 
 ```go
-// 라인 943-1000+: prioritizeNodes()
+// Lines 943-1000+: prioritizeNodes()
 func prioritizeNodes(ctx, extenders, fwk, state, pod, nodes) ([]framework.NodePluginScores, error) {
 
-    // PreScore: 공유 상태 준비 (라인 966)
+    // PreScore: prepare shared state (line 966)
     fwk.RunPreScorePlugins(ctx, state, pod, nodes)
 
-    // Score: 각 노드 점수 계산 (라인 972)
+    // Score: compute scores for each node (line 972)
     nodesScores, err := fwk.RunScorePlugins(ctx, state, pod, nodes)
 
-    // 외부 Extender 점수 추가
+    // Add scores from external Extenders
     for _, extender := range extenders {
         extender.Prioritize(pod, nodes)
     }
 }
 ```
 
-**점수 계산 과정:**
+**Score computation process:**
 ```
-PreScore (공유 캐시 구축)
+PreScore (build shared cache)
     ↓
-Score (플러그인별 0~100점)
+Score (0-100 points per plugin)
     ↓
-NormalizeScore (정규화: 플러그인 내 상대 비교)
+NormalizeScore (normalization: relative comparison within a plugin)
     ↓
-가중치 적용: 플러그인점수 × weight
+Apply weights: plugin score × weight
     ↓
-합산: 노드별 최종 점수
+Sum: final score per node
     ↓
-최고점 노드 선택 (동점 시 랜덤)
+Select highest-scoring node (random on tie)
 ```
 
-**주요 Score 플러그인:**
+**Key Score plugins:**
 
-| 플러그인 | 역할 | 가중치(기본) |
+| Plugin | Role | Weight (default) |
 |---------|------|------------|
-| NodeAffinity | 선호 노드 친화성 점수 | 2 |
-| NodeResourcesFit | 자원 적합도 (LeastAllocated/MostAllocated) | 1 |
-| InterPodAffinity | Pod 간 친화성 점수 | 2 |
-| PodTopologySpread | 토폴로지 균등 분산 | 2 |
-| ImageLocality | 이미지 이미 있는 노드 선호 | 1 |
-| TaintToleration | toleration 선호도 | 1 |
+| NodeAffinity | Preferred node affinity score | 2 |
+| NodeResourcesFit | Resource fit (LeastAllocated/MostAllocated) | 1 |
+| InterPodAffinity | Inter-Pod affinity score | 2 |
+| PodTopologySpread | Even topology spreading | 2 |
+| ImageLocality | Prefer nodes that already have the image | 1 |
+| TaintToleration | Toleration preference | 1 |
 
-#### [3d] PostFilter (프리엠션)
+#### [3d] PostFilter (Preemption)
 
-스케줄링 실패(Filter에서 모든 노드 탈락) 시 실행:
+Runs when scheduling fails (all nodes rejected by Filter):
 
 ```go
-// 라인 293-308: schedulingAlgorithm() 내부
+// Lines 293-308: inside schedulingAlgorithm()
 status := fwk.RunPostFilterPlugins(ctx, state, pod, diagnosis.NodeToStatus)
 ```
 
-**DefaultPreemption 플러그인:**
-1. 우선순위 낮은 Pod가 있는 노드 탐색
-2. 해당 Pod 제거 시 스케줄 가능한지 시뮬레이션
-3. 가능하면 `nominatedNodeName` 설정
-4. 다음 사이클에서 실제 프리엠션 수행
+**DefaultPreemption plugin:**
+1. Find nodes with lower-priority Pods
+2. Simulate whether scheduling succeeds if those Pods are removed
+3. If feasible, set `nominatedNodeName`
+4. Perform the actual preemption in the next cycle
 
 #### [3e] Assume & Reserve
 
-**파일:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L313)
+**File:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L313)
 
 ```go
-// 라인 313-359: assumeAndReserve()
+// Lines 313-359: assumeAndReserve()
 
-// 1. Assume: 캐시에 Pod-노드 할당 예약 (라인 326)
+// 1. Assume: reserve the Pod-node assignment in the cache (line 326)
 sched.Cache.AssumePod(assumedPod)
 
-// 2. Reserve: 리소스 예약 (라인 337)
+// 2. Reserve: reserve resources (line 337)
 fwk.RunReservePluginsReserve(ctx, state, assumedPod, scheduleResult.SuggestedHost)
-// └─ VolumeBinding: PVC 바인딩 예약
-// └─ NodeResources: 메모리상 자원 예약
+// └─ VolumeBinding: reserve PVC binding
+// └─ NodeResources: reserve resources in memory
 ```
 
-**라인 1108-1143: assume()**
+**Lines 1108-1143: assume()**
 ```go
-// Pod에 노드 이름 설정 (실제 API 갱신 전 캐시만)
-assumedPodInfo.Pod.Spec.NodeName = host  // 라인 1113
-sched.Cache.AssumePod(assumedPodInfo.Pod) // 라인 1132-1135
+// Set the node name on the Pod (cache only, before the actual API update)
+assumedPodInfo.Pod.Spec.NodeName = host  // line 1113
+sched.Cache.AssumePod(assumedPodInfo.Pod) // lines 1132-1135
 ```
 
 ---
 
-### [4] 바인딩 사이클
+### [4] Binding Cycle
 
-**파일:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L397)
+**File:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L397)
 
 ```go
-// 라인 397-502: bindingCycle() — 별도 goroutine에서 실행
+// Lines 397-502: bindingCycle() — runs in a separate goroutine
 
-// 1. PreBindPreFlight: nominatedNodeName 업데이트 (라인 411)
+// 1. PreBindPreFlight: update nominatedNodeName (line 411)
 fwk.RunPreBindPreFlights(ctx, state, assumedPod, scheduleResult.SuggestedHost)
 
-// 2. Permit: 최종 허가 대기 (라인 431)
+// 2. Permit: wait for final approval (line 431)
 fwk.WaitOnPermit(ctx, assumedPod)
 
-// 3. Done: 큐에서 in-flight 제거 (라인 453)
+// 3. Done: remove in-flight entry from the queue (line 453)
 sched.SchedulingQueue.Done(assumedPod.UID)
 
-// 4. PreBind: 바인딩 전 처리 (라인 464)
+// 4. PreBind: pre-bind processing (line 464)
 fwk.RunPreBindPlugins(ctx, state, assumedPod, scheduleResult.SuggestedHost)
-// └─ VolumeBinding.PreBind: PVC를 실제 PV에 바인딩
+// └─ VolumeBinding.PreBind: bind PVCs to actual PVs
 
-// 5. Bind: API 서버에 nodeName 설정 (라인 476)
+// 5. Bind: set nodeName on the API server (line 476)
 sched.bind(ctx, fwk, assumedPod, scheduleResult.SuggestedHost, state)
 
-// 6. PostBind (라인 493)
+// 6. PostBind (line 493)
 fwk.RunPostBindPlugins(ctx, state, assumedPod, scheduleResult.SuggestedHost)
 ```
 
-**라인 1154-1177: bind()**
+**Lines 1154-1177: bind()**
 ```go
 func (sched *Scheduler) bind(ctx, fwk, assumed, targetNode, state) error {
-    // Extender 바인딩 시도
+    // Try Extender binding
     for _, extender := range fwk.HasFilterPlugins() {
         if extender.IsInterested(assumed) {
-            return extender.Bind(binding)  // 외부 스케줄러가 바인딩
+            return extender.Bind(binding)  // external scheduler performs the binding
         }
     }
-    // 기본 DefaultBinder 사용
+    // Use the default DefaultBinder
     return fwk.RunBindPlugins(ctx, state, assumed, targetNode)
 }
 ```
 
 **DefaultBinder:**
 ```go
-// API 서버에 Pod 업데이트:
+// Update the Pod on the API server:
 // PATCH /api/v1/namespaces/{ns}/pods/{name}/binding
 // body: {"target": {"name": "node-1"}}
 ```
 
 ---
 
-### 확장점(Extension Points) 전체 목록
+### Complete List of Extension Points
 
-**파일:** [pkg/scheduler/framework/interface.go](../pkg/scheduler/framework/interface.go#L180)
+**File:** [pkg/scheduler/framework/interface.go](../pkg/scheduler/framework/interface.go#L180)
 
 ```
-PreEnqueue  → 큐 진입 전 검사
-Sort        → 큐 내 정렬 순서 결정
-PreFilter   → 사이클 시작 전 Pod 레벨 상태 준비
-Filter      → 노드별 적합성 검사
-PostFilter  → 모든 노드 실패 시 (프리엠션)
-PreScore    → Score 전 공유 상태 준비
-Score       → 노드별 점수 계산
-NormalizeScore → 점수 정규화
-Reserve     → 리소스 예약
-Permit      → 바인딩 허가/대기/거부
-PreBind     → 바인딩 전 처리
-Bind        → 실제 바인딩
-PostBind    → 바인딩 후 정리
-Unreserve   → Reserve 롤백 (실패 시)
+PreEnqueue  → check before entering the queue
+Sort        → determine sort order within the queue
+PreFilter   → prepare Pod-level state before the cycle starts
+Filter      → per-node feasibility check
+PostFilter  → when all nodes fail (preemption)
+PreScore    → prepare shared state before Score
+Score       → compute per-node scores
+NormalizeScore → normalize scores
+Reserve     → reserve resources
+Permit      → approve/wait/deny binding
+PreBind     → pre-bind processing
+Bind        → actual binding
+PostBind    → post-bind cleanup
+Unreserve   → roll back Reserve (on failure)
 ```
+
+Each extension point is its own interface (`FilterPlugin`, `ScorePlugin`, `PreBindPlugin`, …), and every in-tree plugin satisfies one *implicitly* — there is no `implements` keyword to grep for. To jump from a plugin interface to its concrete struct, search for the compile-time assertion the plugins declare:
+
+```bash
+# All concrete plugins that implement a given extension point
+rg "var _ framework.PlacementFeasiblePlugin = &" pkg/scheduler/framework/plugins
+```
+
+For example, `GangScheduling` is the struct behind `PlacementFeasiblePlugin` — [gangscheduling.go:58](../pkg/scheduler/framework/plugins/gangscheduling/gangscheduling.go#L58). The same trick (`var _ <Interface> = &<Struct>{}`) locates the implementer for any extension point.
 
 ---
 
-### 실패 처리 및 재큐잉
+### Failure Handling and Requeueing
 
-**파일:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L1200)
+**File:** [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go#L1200)
 
 ```go
-// 라인 1200-1250+: handleSchedulingFailure()
+// Lines 1200-1250+: handleSchedulingFailure()
 func handleSchedulingFailure(ctx, podFwk, podInfo, status, ...) {
 
-    // 1. Pod 조건 업데이트 (PodScheduled=False)
-    // 2. 이벤트 기록
-    // 3. 재큐잉
+    // 1. Update Pod condition (PodScheduled=False)
+    // 2. Record an event
+    // 3. Requeue
     sched.SchedulingQueue.AddUnschedulableIfNotPresent(podInfo, ...)
 }
 ```
 
-**이벤트 기반 재큐잉:** 클러스터 상태 변화 시 unschedulable Pod 재활성화:
-- Node 추가/업데이트
-- 다른 Pod 삭제 (자원 확보)
-- PVC 바운드
-- 기타 리소스 변화
+**Event-driven requeueing:** reactivates unschedulable Pods when the cluster state changes:
+- Node added/updated
+- Another Pod deleted (frees resources)
+- PVC bound
+- Other resource changes
 
 ---
 
-## 성능 최적화 요소
+## Performance Optimizations
 
-| 최적화 | 위치 | 효과 |
+| Optimization | Location | Effect |
 |--------|------|------|
-| 병렬 Filter | `Parallelizer().Until()` | 노드 수에 비례한 처리 속도 |
-| percentageOfNodesToScore | `numFeasibleNodesToScore` | 대규모 클러스터에서 평가 노드 제한 |
-| OpportunisticBatching | 라인 596-616 | 동일 spec Pod의 결과 캐시 재사용 |
-| Backoff & Unschedulable Pool | PriorityQueue | 실패 Pod 즉시 재시도 방지 |
-| 스냅샷 기반 캐시 | `Cache.UpdateSnapshot()` | 읽기 잠금 없는 빠른 노드 조회 |
+| Parallel Filter | `Parallelizer().Until()` | Throughput scales with node count |
+| percentageOfNodesToScore | `numFeasibleNodesToScore` | Limits evaluated nodes in large clusters |
+| OpportunisticBatching | Lines 596-616 | Reuses cached results for Pods with identical specs |
+| Backoff & Unschedulable Pool | PriorityQueue | Prevents immediate retry of failed Pods |
+| Snapshot-based cache | `Cache.UpdateSnapshot()` | Fast lock-free node lookups |
 
 ---
 
-## 핵심 파일 경로 요약
+## Key File Path Summary
 
-| 단계 | 파일 | 핵심 함수 | 라인 |
+| Step | File | Key Function | Line |
 |------|------|----------|------|
-| 큐 | [pkg/scheduler/backend/queue/scheduling_queue.go](../pkg/scheduler/backend/queue/scheduling_queue.go) | `PriorityQueue.Add/Pop` | 728, 945 |
-| 메인 루프 | [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go) | `ScheduleOne` | 67 |
-| 스케줄링 사이클 | [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go) | `schedulingCycle` | 175 |
+| Queue | [pkg/scheduler/backend/queue/scheduling_queue.go](../pkg/scheduler/backend/queue/scheduling_queue.go) | `PriorityQueue.Add/Pop` | 728, 945 |
+| Main loop | [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go) | `ScheduleOne` | 67 |
+| Scheduling cycle | [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go) | `schedulingCycle` | 175 |
 | Filter | [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go) | `findNodesThatPassFilters` | 777 |
 | Score | [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go) | `prioritizeNodes` | 943 |
 | Assume | [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go) | `assumeAndReserve` | 313 |
-| 바인딩 | [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go) | `bindingCycle` | 397 |
-| 프레임워크 | [pkg/scheduler/framework/runtime/framework.go](../pkg/scheduler/framework/runtime/framework.go) | `Framework` 구현 | - |
-| 플러그인 | [pkg/scheduler/framework/plugins/](../pkg/scheduler/framework/plugins/) | 각 플러그인 구현 | - |
+| Binding | [pkg/scheduler/schedule_one.go](../pkg/scheduler/schedule_one.go) | `bindingCycle` | 397 |
+| Framework | [pkg/scheduler/framework/runtime/framework.go](../pkg/scheduler/framework/runtime/framework.go) | `Framework` implementation | - |
+| Plugins | [pkg/scheduler/framework/plugins/](../pkg/scheduler/framework/plugins/) | Individual plugin implementations | - |
 
 ---
 
-## 관련 시나리오
+## Related Concepts
 
-- [시나리오 1: API 요청 흐름](01-api-request-flow.md) — Pod가 etcd에 저장되는 흐름
-- [시나리오 4: kubelet Pod 라이프사이클](04-kubelet-pod-lifecycle.md) — 바인딩된 Pod를 kubelet이 실행하는 흐름
+- **Why split scheduling and binding cycles?** The scheduling cycle is synchronous and CPU-bound (a pure placement decision); the binding cycle is asynchronous and I/O-bound (PVC binding, the API `Bind` write). Separating them keeps node selection fast and serialized while slow API calls run in the background.
+- **Predicates/priorities → the Scheduling Framework.** Older schedulers hard-coded "predicates" (hard filters) and "priorities" (soft scores). Today every decision is a plugin implementing an extension-point interface (`PreFilter`, `Filter`, `Score`, `Reserve`, `Permit`, `Bind`, …) selected per profile — which is why this trace keeps crossing interfaces.
+- **Filter vs. Score.** Filter answers "*can* this Pod run here?" (yes/no, narrows candidates); Score answers "*how good* is this node?" (0–100, ranks survivors). The highest total score wins.
+- **Assume + optimistic cache.** Once a node is chosen, the scheduler writes the assignment into its in-memory cache ("assume") so the *next* Pod already sees those resources consumed — before the API bind completes. A failed bind triggers `Unreserve`/forget to roll it back.
+- **Preemption & PriorityClass.** If nothing fits, `PostFilter` (DefaultPreemption) may evict lower-priority Pods to make room; `nominatedNodeName` marks the intended node while victims drain.
+- **`PodScheduled` condition.** The outcome surfaces as a Pod condition — `True` on success, `False` with a reason on failure — which is exactly what `kubectl describe pod` prints under Events.
+- **`percentageOfNodesToScore`.** In large clusters the scheduler stops after finding "enough" feasible nodes instead of scoring every node, trading perfect placement for latency.
+
+> ⚠️ **The scheduler does not start containers.** It only writes `pod.spec.nodeName` (the Bind). The kubelet on that node (Scenario 4) is what actually pulls images and runs containers.
+
+---
+
+## Related Scenarios
+
+- [Scenario 1: API Request Flow](01-api-request-flow.md) — how a Pod is stored in etcd
+- [Scenario 4: kubelet Pod Lifecycle](04-kubelet-pod-lifecycle.md) — how the kubelet runs a bound Pod

@@ -1,43 +1,75 @@
-# 시나리오 4: kubelet Pod 라이프사이클
+# Scenario 4: kubelet Pod Lifecycle
 
-스케줄러가 Pod에 nodeName을 설정한 이후 kubelet이 Pod를 실행하고 종료하기까지의 전체 흐름을 추적합니다.
+Traces the full flow from the moment the scheduler sets nodeName on a Pod through the kubelet running and terminating it.
 
-## 전체 흐름도
+## Big Picture
+
+The kubelet is a per-node reconciliation engine. It turns desired Pod specs into runtime reality by coordinating three layers: pod worker state machine, CRI runtime operations (sandbox/container lifecycle), and node-local side systems (volumes, probes, status updates). Termination follows the same pattern in reverse, with explicit cleanup checkpoints.
+
+## Interface Resolution Guide (This Scenario)
+
+Kubelet code combines interfaces with constructor wiring. Use this order:
+1. Find the interface field on `Kubelet` or runtime manager.
+2. Check for compile-time assertions.
+3. If absent, follow constructor signatures and assignment lines.
+4. Confirm the concrete implementation used at the call site (`SyncPod`, `RunPodSandbox`, `StartContainer`, etc.).
+
+### Worked Example: `kubecontainer.Runtime` -> `*kubeGenericRuntimeManager`
+
+This is the runtime boundary that controls most of the Pod lifecycle:
+
+1. Interface: `type Runtime interface` in [../pkg/kubelet/container/runtime.go](../pkg/kubelet/container/runtime.go#L74).
+2. Concrete struct: `kubeGenericRuntimeManager` in [../pkg/kubelet/kuberuntime/kuberuntime_manager.go](../pkg/kubelet/kuberuntime/kuberuntime_manager.go#L114).
+3. Factory that hides the type: `kuberuntime.NewKubeGenericRuntimeManager(...)` is called in [../pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L784) and returns a `kubecontainer.Runtime` interface value.
+4. Assignment wiring: kubelet stores that value in `klet.containerRuntime` in [../pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L829).
+5. Runtime call site: the main sync path invokes `kl.containerRuntime.SyncPod(...)` in [../pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L2251), which therefore runs the concrete `kubeGenericRuntimeManager` implementation.
+
+There is no compile-time assertion breadcrumb here. Constructor return type plus field assignment is the proof.
+
+## Reading Guide (Beginner)
+
+- **Trigger:** kubelet receives Pod updates (API watch, static pod source, PLEG resync, or probe-related resync).
+- **Core loop model:** each sync computes desired-vs-actual delta, then applies only required runtime actions.
+- **Probe worker detail:** probe workers are created in `AddPod()` via `newWorker(...)` + `go w.run(ctx)`; there is no `AddWorker` API in this path.
+- **Termination model:** graceful stop is an explicit state transition (`TerminatingPod` -> `TerminatedPod`) with separate cleanup phase.
+- **Success criterion for this scenario:** runtime/container state, volumes, and reported Pod status converge to current Pod intent.
+
+## Overall Flow
 
 ```
-스케줄러: Pod.Spec.NodeName = "node-1" 설정
-        │ (Watch 이벤트)
+Scheduler: sets Pod.Spec.NodeName = "node-1"
+        │ (Watch event)
         ▼
 [1] pkg/kubelet/kubelet.go:Run()
-    초기화: volumeManager, statusManager, pleg.Start()
+    Initialization: volumeManager, statusManager, pleg.Start()
         │
         ▼
 [2] syncLoop() → syncLoopIteration()
-    configCh 이벤트 → HandlePodAdditions()
+    configCh event → HandlePodAdditions()
         │
         ▼
 [3] pkg/kubelet/pod_workers.go:UpdatePod()
-    Pod별 goroutine → podWorkerLoop()
+    Per-Pod goroutine → podWorkerLoop()
         │
-        ├─ 상태: SyncPod
+        ├─ State: SyncPod
         │       ↓
 [4] pkg/kubelet/kuberuntime/kuberuntime_manager.go:SyncPod()
         │
-        ├─ [4a] computePodActions() — 필요한 변경사항 계산
-        ├─ [4b] createPodSandbox() — 네트워킹 설정 (CNI)
-        ├─ [4c] startContainer() — CRI 호출하여 컨테이너 시작
-        │       ├─ EnsureImageExists() — 이미지 Pull
+        ├─ [4a] computePodActions() — compute required changes
+        ├─ [4b] createPodSandbox() — networking setup (CNI)
+        ├─ [4c] startContainer() — start container via CRI call
+        │       ├─ EnsureImageExists() — image pull
         │       ├─ CreateContainer() — CRI gRPC
         │       ├─ StartContainer() — CRI gRPC
-        │       └─ Lifecycle.PostStart 훅
+        │       └─ Lifecycle.PostStart hook
         │
-        ├─ [4d] volumeManager (병렬): Attach → Mount
+        ├─ [4d] volumeManager (parallel): Attach → Mount
         │
-        └─ [4e] probeManager: liveness / readiness / startup probe 시작
+        └─ [4e] probeManager: start liveness / readiness / startup probes
         │
         ▼
-[5] 종료 흐름:
-    DeletionTimestamp 감지 → TerminatingPod
+[5] Termination flow:
+    DeletionTimestamp detected → TerminatingPod
         │
         ├─ SyncTerminatingPod()
         │   ├─ probeManager.StopLivenessAndStartup()
@@ -46,21 +78,21 @@
         │
         └─ SyncTerminatedPod()
             ├─ volumeManager.WaitForUnmount()
-            ├─ 볼륨 디렉토리 정리
-            ├─ Cgroup 제거
+            ├─ clean up volume directories
+            ├─ remove cgroups
             └─ statusManager.TerminatePod()
 ```
 
 ---
 
-## 단계별 상세 분석
+## Step-by-Step Analysis
 
-### [1] kubelet 초기화
+### [1] kubelet Initialization
 
-**파일:** [cmd/kubelet/kubelet.go](../cmd/kubelet/kubelet.go#L35)
+**File:** [cmd/kubelet/kubelet.go](../cmd/kubelet/kubelet.go#L35)
 
 ```go
-// 라인 35-39: main()
+// Lines 35-39: main()
 func main() {
     command := app.NewKubeletCommand()
     code := cli.Run(command)
@@ -68,51 +100,154 @@ func main() {
 }
 ```
 
-**파일:** [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L1858)
+**File:** [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L1858)
 
 ```go
-// 라인 1858-1976: Run()
+// Lines 1858-1976: Run()
 func (kl *Kubelet) Run(ctx context.Context, updates <-chan kubetypes.PodUpdate) {
 
-    // 라인 1899: 내부 모듈 초기화
+    // Line 1899: initialize internal modules
     kl.initializeModules(ctx)
 
-    // 라인 1915: 볼륨 관리자 시작 (별도 goroutine)
+    // Line 1915: start the volume manager (separate goroutine)
     go kl.volumeManager.Run(ctx, sourcesReady)
 
-    // 라인 1956: 상태 관리자 시작 (API 서버로 상태 전송)
+    // Line 1956: start the status manager (sends status to the API server)
     kl.statusManager.Start(ctx)
 
-    // 라인 1964: PLEG (Pod Lifecycle Event Generator) 시작
+    // Line 1964: start PLEG (Pod Lifecycle Event Generator)
     kl.pleg.Start()
 
-    // 라인 1975: 메인 동기화 루프 진입 (블로킹)
+    // Line 1975: enter the main sync loop (blocking)
     kl.syncLoop(ctx, updates, kl)
 }
 ```
 
-**Kubelet 핵심 멤버 (라인 1193-1400+):**
+**Key Kubelet members (lines 1193-1400+):**
 
-| 멤버 | 역할 |
+| Member | Role |
 |------|------|
-| `podManager` | Pod 메타데이터 추적 |
-| `podWorkers` | Pod별 goroutine 관리 |
-| `volumeManager` | 볼륨 Attach/Mount/Unmount |
-| `probeManager` | liveness/readiness/startup probe |
-| `statusManager` | API 서버에 Pod 상태 전송 |
-| `containerRuntime` | CRI 인터페이스 (containerd/cri-o) |
-| `pleg` | 런타임 상태 변화 감지 |
+| `podManager` | Tracks Pod metadata |
+| `podWorkers` | Manages per-Pod goroutines |
+| `volumeManager` | Volume Attach/Mount/Unmount |
+| `probeManager` | liveness/readiness/startup probes |
+| `statusManager` | Sends Pod status to the API server |
+| `containerRuntime` | CRI interface (containerd/cri-o) |
+| `pleg` | Detects runtime state changes |
+
+> ⚠️ **`containerRuntime` is an interface — the real type is `kubeGenericRuntimeManager`.** The field is typed `containerRuntime kubecontainer.Runtime` ([kubelet.go:1404](../pkg/kubelet/kubelet.go#L1404)); the interface lives at [container/runtime.go:74](../pkg/kubelet/container/runtime.go#L74). The concrete struct is `kubeGenericRuntimeManager` ([kuberuntime_manager.go:114](../pkg/kubelet/kuberuntime/kuberuntime_manager.go#L114)). In this path, there is no compile-time `var _ kubecontainer.Runtime = &kubeGenericRuntimeManager{}` assertion to grep for. Instead, prove the binding through wiring: `NewKubeGenericRuntimeManager(...)` returns `kubecontainer.Runtime` ([kubelet.go:784](../pkg/kubelet/kubelet.go#L784)), and that value is assigned to `klet.containerRuntime` ([kubelet.go:829](../pkg/kubelet/kubelet.go#L829)). When the assertion is absent, constructor signature + assignment is the reliable trace.
 
 ---
 
-### [2] SyncLoop — 메인 이벤트 루프
+### [PLEG] Pod Lifecycle Event Generator — How the kubelet Detects Runtime State Changes
 
-**파일:** [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L2703)
+**File:** [pkg/kubelet/pleg/generic.go](../pkg/kubelet/pleg/generic.go#L53)
+
+PLEG bridges the gap between kube-apiserver-based Pod spec changes and the actual state of containers in the runtime. Instead of reading container state on every sync, the kubelet has a single PLEG goroutine that periodically lists runtime state, diffs it against the previous snapshot, and emits typed events that the main `syncLoop` consumes.
+
+> ⚠️ **`kl.pleg` is typed as `PodLifecycleEventGenerator` (interface).** The field is declared at [kubelet.go:1416](../pkg/kubelet/kubelet.go#L1416). The concrete struct in this path is `GenericPLEG` ([generic.go:53](../pkg/kubelet/pleg/generic.go#L53)), constructed and assigned in the kubelet constructor. `GenericPLEG` is called "generic" because it works with any CRI runtime, using only periodic list rather than native runtime event streams.
+
+**`GenericPLEG` struct (lines 53-90):**
 
 ```go
-// 라인 2703-2823: syncLoopIteration() — 5가지 채널 처리
+type GenericPLEG struct {
+    runtime      kubecontainer.Runtime  // CRI bridge — same containerRuntime as kubelet
+    eventChannel chan *PodLifecycleEvent // events consumed by syncLoopIteration via plegCh
+    podRecords   podRecords             // map[podUID]podRecord{old, current}
+    cache        kubecontainer.Cache    // pod status cache shared with kubelet
+    relistDuration *RelistDuration      // configurable relist interval
+    relistRequests chan relistRequest    // on-demand relist trigger
+}
+```
 
-// 1. configCh: API 서버 또는 파일/HTTP에서 Pod 변경 수신
+**`Relist()` — the core polling function (line 289):**
+
+```go
+func (g *GenericPLEG) Relist(ctx context.Context) {
+    g.relistLock.Lock()
+    defer g.relistLock.Unlock()
+
+    // 1. Ask the CRI runtime for all pods + containers (line 303)
+    podList, err := g.runtime.GetPods(ctx, true)
+    // └─ gRPC ListPodSandbox() + ListContainers() on containerd/cri-o
+
+    g.podRecords.setCurrent(pods)
+
+    // 2. For each pod that had any state in old or new snapshot,
+    //    compute events and update the cache (line 313)
+    for pid := range g.podRecords {
+        g.reconcilePodRecord(ctx, pid)
+    }
+
+    // 3. Advance the cache timestamp so kubelet's WaitForCacheSync can unblock
+    g.cache.UpdateTime(timestamp)
+}
+```
+
+**`reconcilePodRecord()` — diff old vs new state (line 330):**
+
+```go
+func (g *GenericPLEG) reconcilePodRecord(ctx, pid) {
+    oldPod := g.podRecords.getOld(pid)
+    pod    := g.podRecords.getCurrent(pid)
+
+    // Walk every container in old ∪ new and compute transition events
+    for _, container := range getContainersFromPods(oldPod, pod) {
+        containerEvents := computeEvents(logger, oldPod, pod, &container.ID)
+        events = append(events, containerEvents...)
+    }
+
+    // If there are events (or a reinspect was queued), update the status cache
+    status, updated, err := g.updateCache(ctx, pod, pid)
+    // └─ calls runtime.GetPodStatus() via CRI gRPC
+    // └─ stores result in g.cache for kubelet to read
+
+    // Emit events onto the channel that syncLoopIteration reads (plegCh)
+    for _, event := range events {
+        g.eventChannel <- event
+    }
+    g.podRecords.update(pid)  // promote current → old for next cycle
+}
+```
+
+**PLEG event types:**
+
+| Event | Meaning |
+|-------|---------|
+| `ContainerStarted` | Container transitioned to running |
+| `ContainerDied` | Container exited (exit code attached as `Data`) |
+| `ContainerRemoved` | Container no longer in runtime list |
+| `PodSync` | Reinspect requested without a specific container change |
+
+`ContainerChanged` events are **filtered out** before emission — they are too noisy and no kubelet component consumes them.
+
+**How `syncLoopIteration` consumes PLEG events:**
+
+```go
+// From syncLoopIteration (kubelet.go:2703)
+case e := <-plegCh:
+    if isSyncPodWorthy(e) {
+        // Look up the Pod in podManager and trigger a SyncPod pass
+        kl.HandlePodSyncs([]*v1.Pod{pod})
+    }
+```
+
+`isSyncPodWorthy` returns true for `ContainerDied` and `ContainerStarted` but not for `ContainerRemoved` alone — removals are handled by the housekeeping path.
+
+**Relist frequency:**
+
+The relist period (default **1 second**) is configurable via `--relist-period` on the kubelet. If a relist takes longer than one period, the next scheduled relist is skipped to avoid queue buildup. PLEG health is surfaced via `kubelet_pleg_relist_duration_seconds` and the `PLEG is not healthy` log line that triggers a node `NotReady` condition.
+
+---
+
+### [2] SyncLoop — Main Event Loop
+
+**File:** [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L2703)
+
+```go
+// Lines 2703-2823: syncLoopIteration() — handles 5 channels
+
+// 1. configCh: receives Pod changes from the API server or file/HTTP
 case u, open := <-configCh:
     switch u.Op {
     case kubetypes.ADD:
@@ -125,175 +260,176 @@ case u, open := <-configCh:
         kl.HandlePodReconcile(u.Pods)
     }
 
-// 2. plegCh: 컨테이너 런타임 상태 변화 감지
+// 2. plegCh: detects container runtime state changes
 case e := <-plegCh:
     if isSyncPodWorthy(e) {
         kl.HandlePodSyncs([]*v1.Pod{pod})
     }
 
-// 3. syncCh: 1초 주기 재동기화
+// 3. syncCh: periodic resync every 1 second
 case <-syncCh:
     podsToSync := kl.getPodsToSync()
     kl.HandlePodSyncs(podsToSync)
 
-// 4. Probe 업데이트
+// 4. Probe updates
 case update := <-kl.livenessManager.Updates():
     if update.Result == proberesults.Failure {
-        kl.HandleProbeSync(pod)  // liveness 실패 → Pod 재시작
+        kl.HandleProbeSync(pod)  // liveness failure → restart Pod
     }
 case update := <-kl.readinessManager.Updates():
-    kl.statusManager.SetContainerReadiness(...)  // ready 상태만 갱신
+    kl.statusManager.SetContainerReadiness(...)  // only updates ready state
 
-// 5. housekeepingCh: 2초 주기 정리
+// 5. housekeepingCh: cleanup every 2 seconds
 case <-housekeepingCh:
     kl.HandlePodCleanups(ctx)
 ```
 
 ---
 
-### [3] Pod Worker — 상태 머신
+### [3] Pod Worker — State Machine
 
-**파일:** [pkg/kubelet/pod_workers.go](../pkg/kubelet/pod_workers.go#L108)
+**File:** [pkg/kubelet/pod_workers.go](../pkg/kubelet/pod_workers.go#L108)
 
-**Pod 상태 (라인 108-119):**
+**Pod states (lines 108-119):**
 ```go
 type PodWorkerState int
 const (
-    SyncPod        PodWorkerState = iota  // 실행 중
-    TerminatingPod                         // 컨테이너 정지 중
-    TerminatedPod                          // 완전 종료, 리소스 정리 중
+    SyncPod        PodWorkerState = iota  // running
+    TerminatingPod                         // stopping containers
+    TerminatedPod                          // fully terminated, cleaning up resources
 )
 ```
 
-**UpdatePod() (라인 751-900+):**
+**UpdatePod() (lines 751-900+):**
 ```go
 func (p *podWorkers) UpdatePod(ctx context.Context, options UpdatePodOptions) {
-    // Pod 처음 등장 시 goroutine 생성 (라인 782-816)
+    // Create a goroutine when the Pod first appears (lines 782-816)
     if !podUpdates, exists := p.podUpdates[uid]; !exists {
         podUpdates = make(chan struct{}, 1)
         p.podUpdates[uid] = podUpdates
-        go p.podWorkerLoop(ctx, uid, podUpdates)  // Pod별 goroutine
+        go p.podWorkerLoop(ctx, uid, podUpdates)  // per-Pod goroutine
     }
 
-    // 종료 전환 감지 (라인 862-890)
+    // Detect transition to termination (lines 862-890)
     if options.RunningPod != nil || d.DeletionTimestamp != nil ||
        isTerminalPhase(d.Phase) || options.UpdateType == SyncPodKill {
-        // 상태를 TerminatingPod로 전환
+        // transition state to TerminatingPod
     }
 
-    // worker 깨우기
+    // wake the worker
     select {
     case podUpdates <- struct{}{}:
-    default:  // 이미 큐에 있으면 무시
+    default:  // ignore if already queued
     }
 }
 ```
 
-**podWorkerLoop() (라인 1231-1363):**
+**podWorkerLoop() (lines 1231-1363):**
 ```go
-// Pod별 goroutine에서 실행
+// Runs in a per-Pod goroutine
 for range podUpdates {
     status, shouldSync, shouldTerminate := p.startPodSync(...)
 
     switch {
     case status == TerminatedPod:
-        p.podSyncer.SyncTerminatedPod(ctx, pod, status)  // 리소스 정리
+        p.podSyncer.SyncTerminatedPod(ctx, pod, status)  // resource cleanup
     case status == TerminatingPod:
-        p.podSyncer.SyncTerminatingPod(ctx, pod, status, ...)  // 컨테이너 정지
+        p.podSyncer.SyncTerminatingPod(ctx, pod, status, ...)  // stop containers
     default:
-        p.podSyncer.SyncPod(ctx, updateType, pod, mirrorPod, status)  // 실행
+        p.podSyncer.SyncPod(ctx, updateType, pod, mirrorPod, status)  // run
     }
 }
 ```
 
 ---
 
-### [4] SyncPod — 컨테이너 실행
+### [4] SyncPod — Running Containers
 
-**파일:** [pkg/kubelet/kuberuntime/kuberuntime_manager.go](../pkg/kubelet/kuberuntime/kuberuntime_manager.go#L1450)
+**File:** [pkg/kubelet/kuberuntime/kuberuntime_manager.go](../pkg/kubelet/kuberuntime/kuberuntime_manager.go#L1450)
 
 ```go
-// 라인 1450-1800+: SyncPod()
+// Lines 1450-1800+: SyncPod()
 func (m *kubeGenericRuntimeManager) SyncPod(ctx, pod, podStatus, auth, backOff) PodSyncResult {
 
-    // 1. 변경사항 계산 (라인 1453)
+    // 1. Compute changes (line 1453)
     podContainerChanges := m.computePodActions(ctx, pod, podStatus)
-    // 반환: 재생성할 컨테이너, init 컨테이너 변경 여부, 샌드박스 변경 여부
+    // Returns: containers to recreate, whether init-container state requires re-running init flow,
+    // and whether the Pod sandbox must be recreated (KillPod=true).
 
-    // 2. 샌드박스 변경이 필요하면 기존 Pod 전체 종료 (라인 1468-1480)
+    // 2. If the sandbox must change, kill the entire existing Pod (lines 1468-1480)
     if podContainerChanges.KillPod {
         m.killPodWithSyncResult(ctx, pod, podStatus, nil)
     }
 
-    // 3. 원치 않는 컨테이너 종료 (라인 1487-1496)
+    // 3. Kill unwanted containers (lines 1487-1496)
     for _, c := range podContainerChanges.ContainersToKill {
         m.killContainer(ctx, pod, c.ID, ...)
     }
 
-    // 4. Pod 샌드박스 생성 (라인 1545-1638)
+    // 4. Create the Pod sandbox (lines 1545-1638)
     podSandboxID, msg, err := m.createPodSandbox(ctx, pod, podContainerChanges.Attempt)
-    // └─ RunPodSandbox() CRI gRPC 호출
-    // └─ CNI 플러그인 호출 → Pod IP 할당, 네트워크 인터페이스 생성
+    // └─ RunPodSandbox() CRI gRPC call
+    // └─ CNI plugin invocation → allocates Pod IP, creates network interface
 
-    // 5. Init 컨테이너 순차 실행 (라인 1682-1700)
+    // 5. Run init containers sequentially (lines 1682-1700)
     for _, container := range pod.Spec.InitContainers {
         m.startContainer(ctx, podSandboxID, podSandboxConfig, &container, pod, ...)
-        // 완료 후 다음 init 컨테이너로
+        // move on to the next init container after completion
     }
 
-    // 6. 일반 컨테이너 실행 (라인 1745-1800)
+    // 6. Run regular containers (lines 1745-1800)
     for _, container := range pod.Spec.Containers {
         m.startContainer(ctx, podSandboxID, podSandboxConfig, &container, pod, ...)
     }
 }
 ```
 
-#### [4b] Pod 샌드박스 생성
+#### [4b] Pod Sandbox Creation
 
 ```go
-// createPodSandbox() — 주요 역할:
-// 1. RuntimeClass 조회
-// 2. CRI: RunPodSandbox() → pause 컨테이너 (infra container) 생성
-// 3. CNI: Pod IP 할당 + veth pair + iptables 규칙
-// 결과: podSandboxID (이후 모든 컨테이너가 이 샌드박스 공유)
+// createPodSandbox() — main responsibilities:
+// 1. Look up the RuntimeClass
+// 2. CRI: RunPodSandbox() → creates the pause container (infra container)
+// 3. CNI: Pod IP allocation + veth pair + iptables rules
+// Result: podSandboxID (all subsequent containers share this sandbox)
 ```
 
-#### [4c] startContainer() — 컨테이너 시작
+#### [4c] startContainer() — Starting a Container
 
-**파일:** [pkg/kubelet/kuberuntime/kuberuntime_container.go](../pkg/kubelet/kuberuntime/kuberuntime_container.go#L199)
+**File:** [pkg/kubelet/kuberuntime/kuberuntime_container.go](../pkg/kubelet/kuberuntime/kuberuntime_container.go#L199)
 
 ```go
-// 라인 199-339: startContainer()
+// Lines 199-339: startContainer()
 func (m *kubeGenericRuntimeManager) startContainer(ctx, podSandboxID, podSandboxConfig,
     spec *v1.Container, pod *v1.Pod, ...) (string, error) {
 
-    // Step 1: 이미지 확인 및 Pull (라인 203-219)
+    // Step 1: Check and pull the image (lines 203-219)
     imageRef, msg, err := m.imagePuller.EnsureImageExists(ctx, pod, spec, ...)
-    // └─ PullImage() CRI gRPC 또는 캐시 히트
+    // └─ PullImage() CRI gRPC or cache hit
 
-    // Step 2: 컨테이너 설정 생성 (라인 221-288)
+    // Step 2: Generate the container config (lines 221-288)
     containerConfig, cleanupAction, err := m.generateContainerConfig(ctx, spec, pod, ...)
-    // 포함: 환경변수(ConfigMap/Secret), 볼륨 마운트, 보안 컨텍스트, 리소스 제한
+    // Includes: environment variables (ConfigMap/Secret), volume mounts, security context, resource limits
 
-    // Step 3: PreCreateContainer 훅 (라인 269)
+    // Step 3: PreCreateContainer hook (line 269)
     m.internalLifecycle.PreCreateContainer(pod, spec, containerConfig)
 
-    // Step 4: CRI CreateContainer (라인 276)
+    // Step 4: CRI CreateContainer (line 276)
     containerID, err := m.runtimeService.CreateContainer(ctx, podSandboxID, containerConfig, podSandboxConfig)
-    // └─ gRPC → containerd/cri-o → OCI 런타임(runc) → 네임스페이스/cgroup 생성
+    // └─ gRPC → containerd/cri-o → OCI runtime (runc) → creates namespaces/cgroups
 
-    // Step 5: PreStartContainer 훅 (라인 282)
+    // Step 5: PreStartContainer hook (line 282)
     m.internalLifecycle.PreStartContainer(pod, spec, containerID)
 
-    // Step 6: CRI StartContainer (라인 291)
+    // Step 6: CRI StartContainer (line 291)
     err = m.runtimeService.StartContainer(ctx, containerID)
-    // └─ 프로세스 실제 시작 (entrypoint 실행)
+    // └─ actually starts the process (runs the entrypoint)
 
-    // Step 7: PostStart 생명주기 훅 (라인 318-336)
+    // Step 7: PostStart lifecycle hook (lines 318-336)
     if container.Lifecycle != nil && container.Lifecycle.PostStart != nil {
         handlerErr := m.runner.Run(ctx, containerID, pod, spec, spec.Lifecycle.PostStart)
         if handlerErr != nil {
-            m.killContainer(...)  // PostStart 실패 → 컨테이너 종료
+            m.killContainer(...)  // PostStart failure → kill the container
         }
     }
 }
@@ -301,205 +437,217 @@ func (m *kubeGenericRuntimeManager) startContainer(ctx, podSandboxID, podSandbox
 
 ---
 
-### [4d] 볼륨 관리
+### [4d] Volume Management
 
-**파일:** [pkg/kubelet/volumemanager/volume_manager.go](../pkg/kubelet/volumemanager/volume_manager.go#L298)
+**File:** [pkg/kubelet/volumemanager/volume_manager.go](../pkg/kubelet/volumemanager/volume_manager.go#L298)
 
 ```go
-// 라인 298-317: Run()
+// Lines 298-317: Run()
 func (vm *volumeManager) Run(ctx, sourcesReady) {
 
-    // CSI 드라이버 정보 감시 (라인 304)
+    // Watch CSI driver info (line 304)
     go vm.volumePluginMgr.Run(ctx)
 
-    // 원하는 볼륨 상태 추적 (라인 307)
+    // Track desired volume state (line 307)
     go vm.desiredStateOfWorldPopulator.Run(ctx, sourcesReady)
-    // └─ Pod spec에서 volumes를 읽어 DesiredStateOfWorld 구성
+    // └─ reads volumes from the Pod spec to build the DesiredStateOfWorld
 
-    // 실제 상태와 조화 (라인 311)
+    // Reconcile with actual state (line 311)
     go vm.reconciler.Run(ctx)
-    // └─ Attach → WaitForAttach → Mount 순으로 실행
-    // └─ 삭제 시: Unmount → Detach
+    // └─ executes in order: Attach → WaitForAttach → Mount
+    // └─ on deletion: Unmount → Detach
 }
 ```
 
-**SyncPod 내 볼륨 대기:**
+**Waiting for volumes within SyncPod:**
 ```go
-// kubelet.go에서 SyncPod 전 호출
+// Called from kubelet.go before SyncPod
 kl.volumeManager.WaitForAttachAndMount(ctx, pod)
-// 모든 볼륨이 마운트될 때까지 블로킹 (타임아웃 있음)
+// Blocks until all volumes are mounted (with a timeout)
 ```
 
 ---
 
-### [4e] Probe 관리
+### [4e] Probe Management
 
-**파일:** [pkg/kubelet/prober/prober_manager.go](../pkg/kubelet/prober/prober_manager.go#L185)
+**File:** [pkg/kubelet/prober/prober_manager.go](../pkg/kubelet/prober/prober_manager.go#L185)
 
 ```go
-// 라인 185-230: AddPod()
-func (m *manager) AddPod(ctx, pod) {
-    for _, c := range pod.Spec.Containers {
+// Lines 185-230: AddPod()
+func (m *manager) AddPod(ctx context.Context, pod *v1.Pod) {
+    // Regular containers + restartable init containers get probe workers.
+    for _, c := range append(pod.Spec.Containers, getRestartableInitContainers(pod)...) {
         if c.StartupProbe != nil {
-            m.AddWorker(ctx, pod, &c, startup)  // 별도 goroutine
+            w := newWorker(m, startup, pod, c)
+            m.workers[key] = w
+            go w.run(ctx)
         }
         if c.ReadinessProbe != nil {
-            m.AddWorker(ctx, pod, &c, readiness)
+            w := newWorker(m, readiness, pod, c)
+            m.workers[key] = w
+            go w.run(ctx)
         }
         if c.LivenessProbe != nil {
-            m.AddWorker(ctx, pod, &c, liveness)
+            w := newWorker(m, liveness, pod, c)
+            m.workers[key] = w
+            go w.run(ctx)
         }
     }
 }
 ```
 
-**파일:** [pkg/kubelet/prober/worker.go](../pkg/kubelet/prober/worker.go)
+> ⚠️ **There is no `AddWorker` method in this path.** Worker creation is inline inside `AddPod`: `newWorker(...)` then `go w.run(ctx)` in [prober_manager.go:200](../pkg/kubelet/prober/prober_manager.go#L200), [prober_manager.go:214](../pkg/kubelet/prober/prober_manager.go#L214), and [prober_manager.go:228](../pkg/kubelet/prober/prober_manager.go#L228).
 
-**Probe Worker 동작:**
+**File:** [pkg/kubelet/prober/worker.go](../pkg/kubelet/prober/worker.go)
+
+**Probe worker behavior:**
 ```
-1. initialDelaySeconds 대기
-2. 주기적으로 probe 실행 (HTTP/TCP/gRPC/Exec)
-3. 결과를 resultsManager에 저장
-4. syncLoopIteration에서 결과 감지:
-   - startup 실패 → 컨테이너 재시작 (restartPolicy 적용)
-   - liveness 실패 → 컨테이너 재시작
-   - readiness 변화 → status 업데이트 (트래픽 라우팅 영향)
+1. Wait initialDelaySeconds
+2. Run the probe periodically (HTTP/TCP/gRPC/Exec)
+3. Store the result in resultsManager
+4. Result detected in syncLoopIteration:
+   - startup failure → restart container (restartPolicy applies)
+   - liveness failure → restart container
+    - readiness change → status update (affects traffic routing)
+5. `UpdatePodStatus()` can trigger an immediate readiness probe run (`manualTriggerCh`) to reduce stale readiness windows
 ```
 
-**Probe 종류별 동작:**
+**Behavior by probe type:**
 
-| Probe | 실패 시 동작 | 성공 시 동작 |
+| Probe | On Failure | On Success |
 |-------|------------|------------|
-| `startupProbe` | 컨테이너 재시작 (liveness/readiness 비활성화) | liveness/readiness 활성화 |
-| `livenessProbe` | 컨테이너 재시작 | 무시 |
-| `readinessProbe` | Ready=False (Service 엔드포인트에서 제거) | Ready=True |
+| `startupProbe` | Restart container (liveness/readiness disabled) | Enable liveness/readiness |
+| `livenessProbe` | Restart container | Ignored |
+| `readinessProbe` | Ready=False (removed from Service endpoints) | Ready=True |
 
 ---
 
-### [5] Graceful 종료 흐름
+### [5] Graceful Termination Flow
 
 #### SyncTerminatingPod
 
-**파일:** [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L2297)
+**File:** [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L2297)
 
 ```go
-// 라인 2297-2416: SyncTerminatingPod()
+// Lines 2297-2416: SyncTerminatingPod()
 func (kl *Kubelet) SyncTerminatingPod(ctx, pod, podStatus, gracePeriod, podStatusFn) error {
 
-    // 1. 최종 상태 기록 (라인 2319)
+    // 1. Record the final status (line 2319)
     kl.statusManager.SetPodStatus(ctx, pod, apiPodStatus)
 
-    // 2. Liveness/Startup probe 중지 (라인 2331)
+    // 2. Stop liveness/startup probes (line 2331)
     kl.probeManager.StopLivenessAndStartup(pod)
-    // readiness는 계속 실행 (관찰 목적)
+    // readiness keeps running (for observation)
 
-    // 3. Pod 종료 (라인 2334)
+    // 3. Kill the Pod (line 2334)
     kl.killPod(ctx, pod, podStatus, gracePeriod)
     // ↓
     // kuberuntime_manager.go:KillPodByID()
-    //   └─ 각 컨테이너에 SIGTERM 전송
-    //   └─ gracePeriod 초 대기 (기본 30초)
-    //   └─ 남은 컨테이너에 SIGKILL
+    //   └─ send SIGTERM to each container
+    //   └─ wait gracePeriod seconds (default 30s)
+    //   └─ SIGKILL remaining containers
     //   └─ StopPodSandbox() CRI gRPC
 
-    // 4. 모든 probe 제거 (라인 2344)
+    // 4. Remove all probes (line 2344)
     kl.probeManager.RemovePod(pod)
 
-    // 5. 모든 컨테이너 정지 확인 (라인 2365-2410)
-    // 미정지 컨테이너 있으면 에러 반환 (재시도)
+    // 5. Verify all containers are stopped (lines 2365-2410)
+    // Return an error if any container is still running (retried)
 }
 ```
 
-**graceful termination 타임라인:**
+**Graceful termination timeline:**
 ```
-DeletionTimestamp 설정
-    ├─ PreStop 훅 실행 (있으면)
-    ├─ SIGTERM 전송
-    ├─ terminationGracePeriodSeconds 대기 (기본 30초)
-    └─ SIGKILL 전송 (아직 실행 중이면)
+DeletionTimestamp set
+    ├─ run PreStop hook (if present)
+    ├─ send SIGTERM
+    ├─ wait terminationGracePeriodSeconds (default 30s)
+    └─ send SIGKILL (if still running)
 ```
 
-**강제 종료 시간 단축:**
+**Shortening forced termination:**
 ```
-실제 grace period = min(
+actual grace period = min(
     pod.Spec.TerminationGracePeriodSeconds,
-    --force-delete 플래그의 gracePeriodSeconds  ← kubectl delete --grace-period=0
+    gracePeriodSeconds from the --force-delete flag  ← kubectl delete --grace-period=0
 )
 ```
 
-#### SyncTerminatedPod — 리소스 정리
+#### SyncTerminatedPod — Resource Cleanup
 
-**파일:** [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L2466)
+**File:** [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go#L2466)
 
 ```go
-// 라인 2466-2533: SyncTerminatedPod()
+// Lines 2466-2533: SyncTerminatedPod()
 func (kl *Kubelet) SyncTerminatedPod(ctx, pod, podStatus) error {
 
-    // 1. 최종 상태 표시 (라인 2480)
+    // 1. Mark the final status (line 2480)
     kl.statusManager.SetPodStatus(ctx, pod, apiPodStatus)
 
-    // 2. 볼륨 언마운트 대기 (라인 2486)
+    // 2. Wait for volume unmount (line 2486)
     kl.volumeManager.WaitForUnmount(ctx, pod)
 
-    // 3. 볼륨 데이터 디렉토리 삭제 (라인 2493-2502)
+    // 3. Delete volume data directories (lines 2493-2502)
     kl.removeOrphanedPodVolumeDirs(pod.UID)
 
-    // 4. Secret/ConfigMap 등록 해제 (라인 2505-2510)
+    // 4. Unregister Secret/ConfigMap (lines 2505-2510)
     kl.secretManager.UnregisterPod(pod)
     kl.configMapManager.UnregisterPod(pod)
 
-    // 5. Cgroup 제거 (라인 2517-2524)
-    pcm.Destroy(...)  // CPU/메모리 cgroup 삭제
+    // 5. Remove cgroups (lines 2517-2524)
+    pcm.Destroy(...)  // delete CPU/memory cgroups
 
-    // 6. User namespace 해제 (라인 2526, 활성화된 경우)
+    // 6. Release the user namespace (line 2526, if enabled)
     kl.usernsManager.Release(pod.UID)
 
-    // 7. 최종 종료 표시 (라인 2529)
+    // 7. Mark final termination (line 2529)
     kl.statusManager.TerminatePod(logger, pod)
 }
 ```
 
 ---
 
-### CRI (Container Runtime Interface) 통신
+### CRI (Container Runtime Interface) Communication
 
-kubelet과 컨테이너 런타임(containerd, CRI-O) 간의 gRPC 인터페이스:
+The gRPC interface between the kubelet and the container runtime (containerd, CRI-O):
 
 ```
 kubelet
     │ gRPC (unix socket)
     ▼
-CRI 런타임 (containerd / CRI-O)
+CRI runtime (containerd / CRI-O)
     │
     ├─ RuntimeService:
-    │   RunPodSandbox()       → pause 컨테이너 생성
-    │   CreateContainer()     → OCI 스펙 생성
-    │   StartContainer()      → runc 실행
+    │   RunPodSandbox()       → create pause container
+    │   CreateContainer()     → create OCI spec
+    │   StartContainer()      → run runc
     │   StopContainer()       → SIGTERM/SIGKILL
-    │   RemoveContainer()     → 컨테이너 제거
-    │   StopPodSandbox()      → 네트워크 정리
+    │   RemoveContainer()     → remove container
+    │   StopPodSandbox()      → network cleanup
     │
     └─ ImageService:
-        PullImage()            → 이미지 다운로드
-        ListImages()           → 로컬 이미지 목록
-        RemoveImage()          → 이미지 삭제
+        PullImage()            → download image
+        ListImages()           → list local images
+        RemoveImage()          → delete image
 ```
+
+> ⚠️ **Behind `RuntimeService`/`ImageService`.** These are the CRI interfaces (`internalapi.RuntimeService`, held as `runtimeService internalapi.RuntimeService` at [kubelet.go:1410](../pkg/kubelet/kubelet.go#L1410)). The concrete client that actually speaks gRPC is `remoteRuntimeService` ([cri-client/pkg/remote_runtime.go:48](../staging/src/k8s.io/cri-client/pkg/remote_runtime.go#L48)), built by `NewRemoteRuntimeService(...)` ([remote_runtime.go:232](../staging/src/k8s.io/cri-client/pkg/remote_runtime.go#L232)). So `RunPodSandbox()` and friends are interface method calls that ultimately hit the gRPC stub inside `remoteRuntimeService` — swappable with a fake in tests.
 
 ---
 
-## Pod 상태 머신 요약
+## Pod State Machine Summary
 
 ```
-                        [스케줄러 바인딩]
+                       [scheduler binding]
                               │
                               ▼
 Pending ──────────────────────────────────────────────────────→ Running
                               │
-                   [SyncPod: 샌드박스+컨테이너 시작]
+                [SyncPod: start sandbox + containers]
                               │
               ┌───────────────┼───────────────┐
               ▼               ▼               ▼
-    [모두 완료]        [liveness 실패]   [DeletionTimestamp]
+  [all completed]    [liveness failure]  [DeletionTimestamp]
          │               [OOMKilled]          │
          ▼                    │               ▼
      Succeeded        [restartPolicy]   Terminating
@@ -507,32 +655,46 @@ Pending ────────────────────────
                     ┌────────┴────────┐        │
                     ▼                ▼         ▼
                  Always         OnFailure   Terminated
-                 재시작            재시작   [리소스 정리]
+                 restart          restart  [resource cleanup]
                                   │              │
                                Never            ▼
-                               종료         Pod 삭제
+                               stop        Pod deleted
 ```
 
 ---
 
-## 핵심 파일 경로 요약
+## Key File Path Summary
 
-| 단계 | 파일 | 핵심 함수 | 라인 |
+| Step | File | Key Function | Line |
 |------|------|----------|------|
-| 진입점 | [cmd/kubelet/kubelet.go](../cmd/kubelet/kubelet.go) | `main` | 35 |
-| 초기화 | [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go) | `Run` | 1858 |
-| 메인 루프 | [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go) | `syncLoopIteration` | 2703 |
+| Entry point | [cmd/kubelet/kubelet.go](../cmd/kubelet/kubelet.go) | `main` | 35 |
+| Initialization | [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go) | `Run` | 1858 |
+| Main loop | [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go) | `syncLoopIteration` | 2703 |
 | Pod Worker | [pkg/kubelet/pod_workers.go](../pkg/kubelet/pod_workers.go) | `UpdatePod`, `podWorkerLoop` | 751, 1231 |
 | SyncPod | [pkg/kubelet/kuberuntime/kuberuntime_manager.go](../pkg/kubelet/kuberuntime/kuberuntime_manager.go) | `SyncPod` | 1450 |
-| 컨테이너 시작 | [pkg/kubelet/kuberuntime/kuberuntime_container.go](../pkg/kubelet/kuberuntime/kuberuntime_container.go) | `startContainer` | 199 |
-| 볼륨 관리 | [pkg/kubelet/volumemanager/volume_manager.go](../pkg/kubelet/volumemanager/volume_manager.go) | `Run` | 298 |
-| Probe 관리 | [pkg/kubelet/prober/prober_manager.go](../pkg/kubelet/prober/prober_manager.go) | `AddPod` | 185 |
-| Graceful 종료 | [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go) | `SyncTerminatingPod` | 2297 |
-| 리소스 정리 | [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go) | `SyncTerminatedPod` | 2466 |
+| Container start | [pkg/kubelet/kuberuntime/kuberuntime_container.go](../pkg/kubelet/kuberuntime/kuberuntime_container.go) | `startContainer` | 199 |
+| Volume management | [pkg/kubelet/volumemanager/volume_manager.go](../pkg/kubelet/volumemanager/volume_manager.go) | `Run` | 298 |
+| Probe management | [pkg/kubelet/prober/prober_manager.go](../pkg/kubelet/prober/prober_manager.go) | `AddPod` | 185 |
+| Graceful termination | [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go) | `SyncTerminatingPod` | 2297 |
+| Resource cleanup | [pkg/kubelet/kubelet.go](../pkg/kubelet/kubelet.go) | `SyncTerminatedPod` | 2466 |
 
 ---
 
-## 관련 시나리오
+## Related Concepts
 
-- [시나리오 2: Pod 스케줄링](02-pod-scheduling.md) — kubelet이 Pod를 받기 전 스케줄링 흐름
-- [시나리오 5: Service 네트워크 라우팅](05-service-network-routing.md) — readinessProbe와 EndpointSlice의 연관
+- **CRI / OCI / runc.** The kubelet speaks the **CRI** gRPC API to a runtime (containerd, CRI-O); that runtime then drives an **OCI** runtime (runc) to create the actual Linux namespaces and cgroups. The kubelet never invokes runc directly — it only knows CRI.
+- **Pod sandbox & the pause container.** A Pod's "sandbox" is a tiny **pause** container that owns the network namespace; the app containers *join* that namespace, which is why every container in a Pod shares one IP and can reach each other over `localhost`.
+- **CNI.** Once the sandbox exists, a **CNI** plugin wires the Pod into the network (veth pair, IP allocation, routes). CNI runs at sandbox creation, not per app container.
+- **PLEG (Pod Lifecycle Event Generator).** Rather than trusting every runtime event, the kubelet periodically *relists* container states and emits sync events on any drift — the safety net behind `plegCh` that catches missed transitions.
+- **Static pods & mirror pods.** Pods sourced from a file/HTTP endpoint (not the API) are **static**; the kubelet publishes a read-only **mirror pod** to the API so they're visible. This is how kubeadm runs the control plane itself.
+- **cgroups & QoS classes.** Requests/limits become cgroup settings; a Pod's QoS class (Guaranteed / Burstable / BestEffort), derived from those values, decides OOM-kill priority and eviction order under pressure.
+- **Probe semantics.** Startup probes gate the others; a **liveness** failure *restarts* the container; a **readiness** failure only removes the Pod from Service endpoints (Scenario 5) without restarting. That asymmetry is the most common probe gotcha.
+
+> ⚠️ **`SyncPod` is idempotent and convergent.** It is called repeatedly, and each call computes the delta between desired and actual container state (`computePodActions`). One call does not mean "start once" — it means "make reality match the spec right now."
+
+---
+
+## Related Scenarios
+
+- [Scenario 2: Pod Scheduling](02-pod-scheduling.md) — the scheduling flow before the kubelet receives the Pod
+- [Scenario 5: Service Network Routing](05-service-network-routing.md) — the relationship between readinessProbe and EndpointSlice

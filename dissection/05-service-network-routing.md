@@ -1,14 +1,47 @@
-# 시나리오 5: Service 생성 및 네트워크 트래픽 라우팅
+# Scenario 5: Service Creation and Network Traffic Routing
 
-Service가 생성된 후 kube-proxy가 iptables 규칙을 만들어 Pod 간 통신이 이루어지기까지의 흐름을 추적합니다.
+Traces the flow from Service creation through kube-proxy building iptables rules until Pod-to-Pod communication is established.
 
-## 전체 흐름도
+## Big Picture
+
+Service routing is split between control-plane object convergence and node-local packet programming. Controllers convert Service selectors into endpoint objects, while kube-proxy watches those objects and incrementally materializes deterministic iptables state. Data-plane packets then follow kernel NAT rules, not Go code, at request time.
+
+## Interface Resolution Guide (This Scenario)
+
+The main interface boundary is proxier selection. Use this order:
+1. Start from `proxy.Provider`.
+2. Enumerate concrete implementations via compile-time assertions.
+3. Follow `createProxier` mode-based selection.
+4. Verify concrete method execution in the selected proxier (`syncProxyRules`).
+
+### Worked Example: `proxy.Provider` -> mode-specific `*Proxier`
+
+This is the exact wiring that decides whether kube-proxy uses iptables, IPVS, or nftables:
+
+1. Interface: `type Provider interface` in [../pkg/proxy/types.go](../pkg/proxy/types.go#L28).
+2. Compile-time proofs: `var _ proxy.Provider = &Proxier{}` in [../pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go#L206), [../pkg/proxy/ipvs/proxier.go](../pkg/proxy/ipvs/proxier.go#L239), and [../pkg/proxy/nftables/proxier.go](../pkg/proxy/nftables/proxier.go#L199).
+3. Factory functions: each mode exposes `NewProxier(...)` in [../pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go#L209), [../pkg/proxy/ipvs/proxier.go](../pkg/proxy/ipvs/proxier.go#L242), and [../pkg/proxy/nftables/proxier.go](../pkg/proxy/nftables/proxier.go#L202).
+4. Runtime selection wiring: `createProxier(...) (proxy.Provider, error)` switches on `config.Mode` and assigns one concrete proxier in [../cmd/kube-proxy/app/server_linux.go](../cmd/kube-proxy/app/server_linux.go#L129).
+5. Runtime use: after startup, the rest of kube-proxy only holds the `proxy.Provider` interface, but methods like `syncProxyRules` run on whichever concrete proxier `createProxier` selected.
+
+When you need the real implementation, the `config.Mode` branch is more important than the interface itself.
+
+## Reading Guide (Beginner)
+
+- **Trigger:** Service/EndpointSlice informer changes enqueue kube-proxy sync work.
+- **Control-plane vs data-plane:** Go controllers/proxy code compute rules; the Linux kernel executes packet forwarding.
+- **Eventual consistency:** endpoint changes are not instantaneous(동시에 일어나는); they appear after the next sync pass applies rules.
+- **Success criterion for this scenario:** ClusterIP/NodePort traffic is DNATed(traffic sent to a Service VIP like 10.0.0.1:80 gets DNATed to a real Pod endpoint like 10.244.0.3:8080) to a healthy backend Pod.
+- **Most common confusion:** kube-proxy is a rule programmer(writes kernel networking rules (iptables, IPVS, or nftables).), not a per-request userspace forwarder.(kube-proxy is like a compiler that generates networking rules; Linux kernel is the runtime that executes them for every packet.)
+
+
+## Overall Flow
 
 ```
 kubectl apply -f service.yaml
         │
-[1] API 서버: Service 저장
-        │ (Watch 이벤트)
+[1] API server: store Service
+        │ (Watch event)
         │
         ├──────────────────────────────────────────────┐
         ▼                                              ▼
@@ -16,74 +49,74 @@ kubectl apply -f service.yaml
      endpoints_controller.go                          endpointslice_controller.go
      syncService()                                    syncService()
         │                                              │
-        │ Service selector로 Pod 매칭                  │ max 100개씩 슬라이스
+        │ Match Pods via Service selector              │ Slices of max 100 each
         ▼                                              ▼
-     Endpoints 객체 생성/업데이트              EndpointSlice 객체 생성/업데이트
+     Create/update Endpoints object           Create/update EndpointSlice object
         │                                              │
         └───────────────────┬──────────────────────────┘
-                            │ (Watch 이벤트)
+                            │ (Watch event)
                             ▼
-[3] 각 노드의 kube-proxy
+[3] kube-proxy on each node
     pkg/proxy/iptables/proxier.go
         │
-        ├─ OnServiceUpdate() → serviceChanges 누적
-        ├─ OnEndpointSliceUpdate() → endpointSliceCache 갱신
+        ├─ OnServiceUpdate() → accumulate serviceChanges
+        ├─ OnEndpointSliceUpdate() → refresh endpointSliceCache
         └─ Sync() → syncRunner.Run()
                         │
                         ▼
 [4] syncProxyRules()
         │
-        ├─ serviceChanges/endpointChanges → svcPortMap, endpointsMap 업데이트
-        ├─ 서비스별 iptables 체인/규칙 생성 (메모리 버퍼)
-        └─ iptables-restore 원자적 적용
+        ├─ serviceChanges/endpointChanges → update svcPortMap, endpointsMap
+        ├─ Generate per-service iptables chains/rules (in-memory buffer)
+        └─ Apply atomically via iptables-restore
         │
         ▼
-[5] 커널 iptables
-    패킷: 클라이언트 → ClusterIP → DNAT → Pod IP
+[5] Kernel iptables
+    Packet: client → ClusterIP → DNAT → Pod IP
 ```
 
 ---
 
-## 단계별 상세 분석
+## Step-by-Step Analysis
 
-### [2a] Endpoint 컨트롤러 (Legacy)
+### [2a] Endpoint Controller (Legacy)
 
-**파일:** [pkg/controller/endpoint/endpoints_controller.go](../pkg/controller/endpoint/endpoints_controller.go#L79)
+**File:** [pkg/controller/endpoint/endpoints_controller.go](../pkg/controller/endpoint/endpoints_controller.go#L79)
 
 ```go
-// 라인 79-129: NewEndpointController() — 3개 Informer 등록
+// Lines 79-129: NewEndpointController() — registers 3 informers
 func NewEndpointController(ctx, podInformer, serviceInformer, endpointsInformer, ...) *Controller {
     e.queue = workqueue.NewTypedRateLimitingQueue(...)
 
-    // Service 변경 → 즉시 큐 추가
+    // Service change → enqueue immediately
     serviceInformer.Informer().AddEventHandler(...)
-    // Pod 변경 → 관련 Service 큐 추가 (selector 매칭)
+    // Pod change → enqueue related Services (selector matching)
     podInformer.Informer().AddEventHandler(...)
 }
 ```
 
-**핵심 함수: syncService() (라인 334-542)**
+**Key function: syncService() (lines 334-542)**
 
 ```go
 func (e *Controller) syncService(ctx, key) error {
 
-    // 1. Service 조회 (라인 345)
+    // 1. Look up the Service (line 345)
     service, err := e.serviceLister.Services(namespace).Get(name)
 
-    // 2. Service의 selector로 Pod 조회 (라인 378)
+    // 2. List Pods using the Service's selector (line 378)
     pods, err := e.podLister.Pods(service.Namespace).List(
         labels.Set(service.Spec.Selector).AsSelectorPreValidated())
 
-    // 3. 각 Pod를 EndpointAddress로 변환 (라인 390-430)
+    // 3. Convert each Pod to an EndpointAddress (lines 390-430)
     for _, pod := range pods {
         if !podutil.IsPodReady(pod) {
-            // ready가 아닌 Pod는 NotReadyAddresses에 추가
+            // Pods that are not ready go into NotReadyAddresses
         }
         epAddress := podToEndpointAddressForService(svc, pod)
-        // Pod IP, 포트, TargetRef(Pod 참조) 설정
+        // Set Pod IP, port, TargetRef (Pod reference)
     }
 
-    // 4. 기존 Endpoints와 비교하여 변경 시 업데이트 (라인 503-509)
+    // 4. Compare with existing Endpoints and update on change (lines 503-509)
     if createEndpoints {
         e.client.CoreV1().Endpoints(namespace).Create(ctx, newEndpoints, ...)
     } else if endpointsChanged(currentEndpoints, newEndpoints) {
@@ -94,58 +127,58 @@ func (e *Controller) syncService(ctx, key) error {
 
 ---
 
-### [2b] EndpointSlice 컨트롤러 (Modern, 권장)
+### [2b] EndpointSlice Controller (Modern, Recommended)
 
-**파일:** [pkg/controller/endpointslice/endpointslice_controller.go](../pkg/controller/endpointslice/endpointslice_controller.go#L84)
+**File:** [pkg/controller/endpointslice/endpointslice_controller.go](../pkg/controller/endpointslice/endpointslice_controller.go#L84)
 
 ```go
-// 라인 84-190: NewController() — 4개 Informer 등록
+// Lines 84-190: NewController() — registers 4 informers
 func NewController(ctx, podInformer, serviceInformer, nodeInformer, endpointSliceInformer, ...) *Controller {
 
     c.reconciler = endpointslicerec.NewReconciler(
         c.client,
         c.nodeLister,
-        c.maxEndpointsPerSlice,  // 기본 100
+        c.maxEndpointsPerSlice,  // default 100
         c.endpointSliceTracker,
-        c.topologyCache,         // 노드 토폴로지 (zone 정보)
+        c.topologyCache,         // node topology (zone info)
         c.eventRecorder,
     )
 }
 ```
 
-**EndpointSlice 특징:**
-- Endpoints 대비 최대 100개 단위 분할 → 대규모 클러스터 성능 개선
-- 노드 토폴로지 정보 포함 (zone 기반 트래픽 최적화)
-- 변경 시 전체 재작성 없이 부분 업데이트
+**EndpointSlice characteristics:**
+- Split into chunks of at most(최대) 100, unlike Endpoints → better performance in large clusters
+- Includes node topology information (zone-based traffic optimization)
+- Partial updates on change instead of rewriting the whole object
 
 ---
 
-### [3] kube-proxy 초기화
+### [3] kube-proxy Initialization
 
-**파일:** [cmd/kube-proxy/app/server.go](../cmd/kube-proxy/app/server.go#L183)
+**File:** [cmd/kube-proxy/app/server.go](../cmd/kube-proxy/app/server.go#L183)
 
 ```go
-// 라인 183-293: newProxyServer()
+// Lines 183-293: newProxyServer()
 func newProxyServer(ctx, config, ...) (*ProxyServer, error) {
     s := &ProxyServer{
         Config:      config,
         Client:      createClient(...),
         NodeManager: proxy.NewNodeManager(...),
-        Proxier:     s.createProxier(ctx, config, ...),  // iptables/ipvs 프록시 생성
+        Proxier:     s.createProxier(ctx, config, ...),  // create iptables/ipvs proxier
     }
 }
 ```
 
-**파일:** [cmd/kube-proxy/app/server_linux.go](../cmd/kube-proxy/app/server_linux.go#L129)
+**File:** [cmd/kube-proxy/app/server_linux.go](../cmd/kube-proxy/app/server_linux.go#L129)
 
 ```go
-// 라인 129-181: createProxier()
+// Lines 129-181: createProxier()
 func (s *ProxyServer) createProxier(ctx, config, ...) (proxy.Provider, error) {
     if config.Mode == proxyconfigapi.ProxyModeIPTables {
         return iptables.NewProxier(
             ctx, s.PrimaryIPFamily, ipts[s.PrimaryIPFamily],
-            config.SyncPeriod.Duration,     // 전체 재동기화 주기 (기본 30초)
-            config.MinSyncPeriod.Duration,  // 최소 동기화 간격
+            config.SyncPeriod.Duration,     // full resync period (default 30s)
+            config.MinSyncPeriod.Duration,  // minimum sync interval
             config.Linux.MasqueradeAll,
             localDetectors[s.PrimaryIPFamily],
             s.NodeName, s.NodeIPs[s.PrimaryIPFamily], ...)
@@ -153,10 +186,17 @@ func (s *ProxyServer) createProxier(ctx, config, ...) (proxy.Provider, error) {
 }
 ```
 
-**파일:** [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go#L214)
+> ⚠️ **`createProxier` returns the `proxy.Provider` interface — the concrete type depends on the mode.** `proxy.Provider` is defined at [pkg/proxy/types.go:28](../pkg/proxy/types.go#L28). Each proxy mode ships its own concrete `Proxier` struct, each pinned with a compile-time assertion:
+> - iptables: `Proxier` ([proxier.go:127](../pkg/proxy/iptables/proxier.go#L127)) — `var _ proxy.Provider = &Proxier{}` ([proxier.go:206](../pkg/proxy/iptables/proxier.go#L206))
+> - ipvs: `Proxier` ([proxier.go:148](../pkg/proxy/ipvs/proxier.go#L148)) — assertion at [proxier.go:239](../pkg/proxy/ipvs/proxier.go#L239)
+> - nftables: `Proxier` ([proxier.go:133](../pkg/proxy/nftables/proxier.go#L133)) — assertion at [proxier.go:199](../pkg/proxy/nftables/proxier.go#L199)
+>
+> The `var _ proxy.Provider = &Proxier{}` lines are the fastest way to enumerate every implementation; `createProxier` picks one by `config.Mode` at startup, so the rest of kube-proxy only ever sees the interface.
+
+**File:** [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go#L214)
 
 ```go
-// 라인 214-324: NewProxier()
+// Lines 214-324: NewProxier()
 func NewProxier(ctx, ipFamily, ipt, syncPeriod, minSyncPeriod, ...) (*Proxier, error) {
     proxier := &Proxier{
         svcPortMap:       make(proxy.ServicePortMap),
@@ -164,36 +204,36 @@ func NewProxier(ctx, ipFamily, ipt, syncPeriod, minSyncPeriod, ...) (*Proxier, e
         serviceChanges:   proxy.NewServiceChangeTracker(ipFamily, newServiceInfo, nil),
         endpointsChanges: proxy.NewEndpointsChangeTracker(ipFamily, nodeName, newEndpointInfo, nil),
 
-        // BoundedFrequencyRunner: 최소 간격과 최대 간격 사이에서 syncProxyRules 실행
+        // BoundedFrequencyRunner: runs syncProxyRules between the min and max intervals
         syncRunner: runner.NewBoundedFrequencyRunner(
             "sync-runner", proxier.syncProxyRules, minSyncPeriod, syncPeriod, proxyutil.FullSyncPeriod),
     }
 
-    // iptables 외부 수정 감지 (라인 314)
+    // Detect external modifications to iptables (line 314)
     go ipt.Monitor(kubeProxyCanaryChain,
         []utiliptables.Table{TableMangle, TableNAT, TableFilter},
-        proxier.forceSyncProxyRules,  // 감지 시 강제 Full Sync
+        proxier.forceSyncProxyRules,  // force a full sync when detected
         syncPeriod, wait.NeverStop)
 }
 ```
 
 ---
 
-### [3] Watch 콜백
+### [3] Watch Callbacks
 
-**파일:** [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go#L459)
+**File:** [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go#L459)
 
 ```go
-// 라인 459-498: 변경 감지 콜백
+// Lines 459-498: change-detection callbacks
 
-// Service 변경
+// Service change
 func (proxier *Proxier) OnServiceUpdate(oldService, service *v1.Service) {
     if proxier.serviceChanges.Update(oldService, service) && proxier.isInitialized() {
-        proxier.Sync()  // syncRunner.Run() → 가능한 빨리 syncProxyRules 실행
+        proxier.Sync()  // syncRunner.Run() → run syncProxyRules as soon as possible
     }
 }
 
-// EndpointSlice 변경
+// EndpointSlice change
 func (proxier *Proxier) OnEndpointSliceAdd(endpointSlice *discovery.EndpointSlice) {
     if proxier.endpointsChanges.EndpointSliceUpdate(endpointSlice, false) && proxier.isInitialized() {
         proxier.Sync()
@@ -203,33 +243,121 @@ func (proxier *Proxier) OnEndpointSliceAdd(endpointSlice *discovery.EndpointSlic
 
 ---
 
-### [4] syncProxyRules() — iptables 규칙 생성 핵심
+### [4] syncProxyRules() — Core of iptables Rule Generation
 
-**파일:** [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go#L638)
+**File:** [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go#L638)
 
-#### 4.1 초기화 및 변경 적용
+`syncProxyRules()` is the function that actually writes Service routing into the
+Linux kernel. Everything before this step just *collected* information (which
+Services exist, which Pods back them). This step *translates* that information
+into iptables rules. Before reading the code, you need three mental models.
+
+**Mental model 1 — What problem is being solved?**
+A Service has a *virtual* IP (the ClusterIP, e.g. `10.96.0.10`) that no network
+card actually owns. When a Pod sends a packet to `10.96.0.10:80`, something has
+to rewrite the destination to a *real* Pod IP (e.g. `10.244.1.5:8080`). That
+rewrite is called **DNAT** (Destination NAT). kube-proxy's entire job is to
+install the DNAT rules that make ClusterIPs work.
+
+**Mental model 2 — iptables vocabulary (the absolute minimum).**
+
+| Term | What it means here |
+| --- | --- |
+| **Table** | A category of rules. kube-proxy mainly uses `nat` (for DNAT/SNAT) and `filter` (for REJECT/DROP). |
+| **Chain** | An ordered list of rules. Linux has built-in chains (`PREROUTING`, `OUTPUT`, `POSTROUTING`); kube-proxy adds its own custom chains, all prefixed `KUBE-` (e.g. `KUBE-SERVICES`, `KUBE-SVC-XXXX`, `KUBE-SEP-XXXX`). |
+| **Rule** | One line: "if the packet matches *these* conditions, do *this* action." |
+| **Jump (`-j`)** | The action "go evaluate that other chain." This is how kube-proxy builds a decision tree: `KUBE-SERVICES` → `KUBE-SVC-<service>` → `KUBE-SEP-<endpoint>`. |
+| **DNAT** | Rewrite the destination IP\:port. This is what turns a ClusterIP into a Pod IP. |
+
+So the structure kube-proxy builds is a two-level tree: a top-level
+`KUBE-SERVICES` chain matches on *which Service* (by ClusterIP+port), jumps to a
+per-Service chain (`KUBE-SVC-*`) that picks *which backend Pod*, which jumps to a
+per-endpoint chain (`KUBE-SEP-*`) that does the actual DNAT.
+
+**Mental model 3 — The "change tracker" pattern.**
+The informer callbacks in step [3] (`OnServiceUpdate`, `OnEndpointSliceAdd`) do
+**not** edit kube-proxy's live maps directly. That would be unsafe (callbacks
+fire concurrently) and wasteful (one rewrite per event). Instead each callback
+*stages* its diff into a tracker (`proxier.serviceChanges`,
+`proxier.endpointsChanges`) and then asks for a sync. `syncProxyRules()` later
+*drains* those staged diffs in one shot. Think of the trackers as an inbox and
+`syncProxyRules()` as the worker that processes the whole inbox at once.
+
+#### 4.1 Initialization and Applying Changes
 
 ```go
-// 라인 638-720: syncProxyRules()
+// Lines 638-720: syncProxyRules()
 func (proxier *Proxier) syncProxyRules() (retryError error) {
     proxier.mu.Lock()
     defer proxier.mu.Unlock()
 
-    if !proxier.isInitialized() { return }  // Service/Endpoint 수신 전 대기
+    if !proxier.isInitialized() { return }  // wait until Services/Endpoints have been received
 
-    // 전체 동기화 필요 여부 (라인 660)
+    // Whether a full sync is needed (line 660)
     doFullSync := proxier.needFullSync ||
         (time.Since(proxier.lastFullSync) > proxyutil.FullSyncPeriod && !proxier.largeClusterMode)
 
-    // 변경 사항 병합 (라인 668)
+    // Merge pending changes (line 668)
     serviceUpdateResult := proxier.svcPortMap.Update(proxier.serviceChanges)
     endpointUpdateResult := proxier.endpointsMap.Update(proxier.endpointsChanges)
 ```
 
-#### 4.2 Jump 규칙 생성 (Full Sync 시)
+**What is `doFullSync`?**
+kube-proxy can rewrite its rules two ways:
+
+- **Full sync** (`doFullSync == true`): regenerate **every** rule for **every**
+  Service from scratch, and re-create the top-level "jump" chains (see 4.2). This
+  is correct but expensive — on a cluster with thousands of Services it produces
+  a huge iptables ruleset.
+- **Partial sync** (`doFullSync == false`): only rewrite the chains for the
+  Services that actually changed since last time, and leave everything else
+  untouched. Much cheaper, used for the common case of "one Service changed."
+
+The boolean decides which mode this run uses. It is `true` when **any** of these hold:
+
+1. `proxier.needFullSync` is set — e.g. on the very first sync after startup, or
+   after a previous sync failed, or when the `Monitor` from step [2] detected
+   that something **outside** kube-proxy flushed the iptables rules (so kube-proxy
+   must rebuild everything).
+2. More than `FullSyncPeriod` has elapsed since the last full sync — a periodic
+   "safety net" rewrite to correct any drift...
+3. ...**unless** `largeClusterMode` is on, in which case the periodic full sync is
+   deliberately skipped because rewriting everything would be too costly. Large
+   clusters rely on partial syncs plus the explicit `needFullSync` triggers.
+
+> ⚠️ A "full sync" is not about *Services*, it is about *rules*. It does not
+> re-fetch anything from the API server — all data is already in
+> `proxier.svcPortMap` / `proxier.endpointsMap` (kept current by the informers).
+> "Full" just means "re-emit the complete iptables ruleset" instead of a delta.
+
+**What does "Merge pending changes" mean?**
+These two lines drain the change-tracker inbox described in Mental Model 3:
 
 ```go
-// 라인 687-713: iptables 점프 체인 설정
+serviceUpdateResult := proxier.svcPortMap.Update(proxier.serviceChanges)
+endpointUpdateResult := proxier.endpointsMap.Update(proxier.endpointsChanges)
+```
+
+- `proxier.serviceChanges` / `proxier.endpointsChanges` hold the **diffs**
+  accumulated from the watch callbacks since the last sync (the staged inbox).
+- `proxier.svcPortMap` / `proxier.endpointsMap` are the **authoritative maps** —
+  kube-proxy's current belief about "all Services" and "all endpoints."
+- `.Update(...)` applies (merges) the staged diffs into the authoritative maps
+  and then **clears the inbox**, so the same change is never processed twice.
+  Internally `Update` calls `merge` (add/replace changed entries) and `unmerge`
+  (delete removed entries) — see [pkg/proxy/servicechangetracker.go](../pkg/proxy/servicechangetracker.go#L168).
+- The returned `serviceUpdateResult` / `endpointUpdateResult` report **what
+  changed** (e.g. which Services were updated, which stale conntrack entries must
+  be cleared). A partial sync uses this to decide which chains to rewrite.
+
+> ⚠️ "Merge" here is bookkeeping on Go maps, not anything to do with iptables
+> yet. After these two lines, the maps are up to date; the actual rule-writing
+> happens further down. This separation is why the inbox/worker split exists.
+
+#### 4.2 Jump Rule Generation (on Full Sync)
+
+```go
+// Lines 687-713: set up iptables jump chains
 // NAT table:
 //   PREROUTING → KUBE-SERVICES
 //   OUTPUT     → KUBE-SERVICES
@@ -241,17 +369,17 @@ func (proxier *Proxier) syncProxyRules() (retryError error) {
 //   OUTPUT  → KUBE-SERVICES
 ```
 
-#### 4.3 서비스별 규칙 생성 (라인 829-1230)
+#### 4.3 Per-Service Rule Generation (lines 829-1230)
 
 ```go
 for svcName, svc := range proxier.svcPortMap {
     svcInfo, _ := svc.(*servicePortInfo)
 
-    // Endpoint 분류
+    // Categorize endpoints
     clusterEndpoints, localEndpoints, hasEndpoints := proxy.CategorizeEndpoints(
         allEndpoints, svcInfo, proxier.nodeName, proxier.topologyLabels)
 
-    // ClusterIP 규칙 (라인 938-957)
+    // ClusterIP rules (lines 938-957)
     if hasInternalEndpoints {
         natRules.Write(
             "-A", "KUBE-SERVICES",
@@ -259,22 +387,22 @@ for svcName, svc := range proxier.svcPortMap {
             "-m", protocol, "-p", protocol,
             "-d", svcInfo.ClusterIP().String(),
             "--dport", strconv.Itoa(svcInfo.Port()),
-            "-j", string(internalTrafficChain))  // KUBE-SVC-xxx 체인
+            "-j", string(internalTrafficChain))  // KUBE-SVC-xxx chain
     } else {
-        // Endpoint 없으면 REJECT
+        // REJECT if there are no endpoints
         filterRules.Write("-A", "KUBE-SERVICES", ..., "-j", "REJECT")
     }
 
-    // NodePort 규칙 (라인 1025-1061)
+    // NodePort rules (lines 1025-1061)
     if svcInfo.NodePort() != 0 && hasEndpoints {
         natRules.Write(
             "-A", "KUBE-NODE-PORTS",
             "-m", protocol, "-p", protocol,
             "--dport", strconv.Itoa(svcInfo.NodePort()),
-            "-j", string(externalTrafficChain))  // KUBE-EXT-xxx 체인
+            "-j", string(externalTrafficChain))  // KUBE-EXT-xxx chain
     }
 
-    // LoadBalancer IP 규칙 (라인 987-1023)
+    // LoadBalancer IP rules (lines 987-1023)
     for _, lbip := range svcInfo.LoadBalancerVIPs() {
         natRules.Write(
             "-A", "KUBE-SERVICES",
@@ -285,16 +413,82 @@ for svcName, svc := range proxier.svcPortMap {
 }
 ```
 
-#### 4.4 Endpoint 로드밸런싱 규칙
+**What are `clusterEndpoints` and `localEndpoints`?**
+A Service can have a *traffic policy* that controls **which** backend Pods are
+eligible to receive a request. `CategorizeEndpoints`
+([pkg/proxy/topology.go](../pkg/proxy/topology.go#L48)) takes the full list of a
+Service's endpoints and splits it into two buckets:
 
-**파일:** [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go#L1446)
+- **`clusterEndpoints`** — the backends used when the traffic policy is
+  `Cluster` (the default). This is essentially *all ready endpoints in the whole
+  cluster* (optionally narrowed by topology/zone hints). A request can be load-
+  balanced to **any** node's Pod. Maximizes spreading, but a packet may take an
+  extra hop to another node and its **source IP gets rewritten** (SNAT) on the
+  way.
+- **`localEndpoints`** — the backends used when the traffic policy is `Local`.
+  This contains **only endpoints running on *this* node**. If a request arrives
+  and there is a local Pod, it is sent there directly. This **preserves the
+  client's source IP** (no extra hop, no SNAT), which matters for things like
+  source-IP-based firewalls or logging — but if no local Pod exists, traffic to
+  that node is dropped.
+- **`hasEndpoints`** (named `hasAnyEndpoints` in the source) — a simple boolean:
+  "does this Service have *any* usable backend at all?" If `false`, kube-proxy
+  installs a **REJECT** rule instead of a DNAT rule, so clients get an immediate
+  "connection refused" rather than a silent timeout.
+
+There are actually two independent policies — `internalTrafficPolicy` governs
+in-cluster (ClusterIP) traffic and `externalTrafficPolicy` governs traffic that
+entered via NodePort/LoadBalancer — which is why the code separately checks
+`hasInternalEndpoints` for the ClusterIP rule and `hasEndpoints` for the NodePort
+rule.
+
+> ⚠️ `CategorizeEndpoints` also has a "terminating endpoints" fallback: if a
+> Service has **no Ready** endpoints but some Pods are still *serving while
+> terminating*, those are used as a last resort so a rolling update does not
+> cause a momentary outage. That is why the function checks `IsServing()` and
+> `IsTerminating()`, not just `IsReady()`.
+
+**How to read the `natRules.Write(...)` call (iptables syntax decoded).**
+`natRules` is just a text buffer; each `Write(...)` appends one line that is later
+fed to `iptables-restore`. The string arguments are exactly the flags you would
+type on an `iptables` command line. Decoding the ClusterIP rule:
 
 ```go
-// 라인 1446-1490: writeServiceToEndpointRules()
+natRules.Write(
+    "-A", "KUBE-SERVICES",                                  // append a rule to chain KUBE-SERVICES
+    "-m", "comment", "--comment", "\"<ns/name> cluster IP\"", // attach a human-readable comment
+    "-m", protocol, "-p", protocol,                        // load the tcp/udp match module, match that protocol
+    "-d", svcInfo.ClusterIP().String(),                    // match packets destined for the ClusterIP
+    "--dport", strconv.Itoa(svcInfo.Port()),               // ...and the Service port
+    "-j", string(internalTrafficChain))                    // if all matched, jump to KUBE-SVC-xxxx
+```
+
+| Argument | iptables meaning |
+| --- | --- |
+| `-A KUBE-SERVICES` | **A**ppend this rule to the `KUBE-SERVICES` chain. |
+| `-m comment --comment "..."` | Load the `comment` match module and attach a label. Purely cosmetic — it makes `iptables-save` readable and lets you grep for a Service. |
+| `-m tcp -p tcp` | Load the protocol match module (`-m tcp`) and require the packet's protocol to be TCP (`-p tcp`). For UDP Services these say `udp`. |
+| `-d <ClusterIP>` | Match only packets whose **d**estination IP is this Service's ClusterIP. |
+| `--dport <port>` | Match only packets whose destination port is the Service port. |
+| `-j KUBE-SVC-xxxx` | The action: **j**ump to the per-Service chain, which then picks an actual backend Pod. |
+
+Put together, that one line means: *"any TCP packet headed for this ClusterIP on
+this port should be handed off to the Service's load-balancing chain."* The
+per-Service chain (`KUBE-SVC-*`) then chooses a backend and the per-endpoint
+chain (`KUBE-SEP-*`) performs the DNAT. The NodePort and LoadBalancer `Write`
+calls are the same pattern with a different match (`--dport <nodePort>` or
+`-d <loadBalancerIP>`) and a different jump target.
+
+#### 4.4 Endpoint Load-Balancing Rules
+
+**File:** [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go#L1446)
+
+```go
+// Lines 1446-1490: writeServiceToEndpointRules()
 func (proxier *Proxier) writeServiceToEndpointRules(natRules, svcPortNameString,
     svcInfo, svcChain, endpoints, args) {
 
-    // Session Affinity (ClientIP 기반)
+    // Session affinity (ClientIP-based)
     if svcInfo.SessionAffinityType() == ServiceAffinityClientIP {
         for _, ep := range endpoints {
             natRules.Write(
@@ -302,17 +496,17 @@ func (proxier *Proxier) writeServiceToEndpointRules(natRules, svcPortNameString,
                 "-m", "recent", "--name", string(epInfo.ChainName),
                 "--rcheck", "--seconds", strconv.Itoa(svcInfo.StickyMaxAgeSeconds()),
                 "--reap",
-                "-j", string(epInfo.ChainName))  // 같은 클라이언트 → 같은 EP
+                "-j", string(epInfo.ChainName))  // same client → same EP
         }
     }
 
-    // 확률적 로드밸런싱 (라인 1468)
+    // Probabilistic load balancing (line 1468)
     numEndpoints := len(endpoints)
     for i, ep := range endpoints {
         args = append(args[:0], "-A", string(svcChain))
 
         if i < numEndpoints-1 {
-            // i번째 규칙: 1/(numEndpoints-i) 확률
+            // i-th rule: probability 1/(numEndpoints-i)
             args = append(args,
                 "-m", "statistic", "--mode", "random",
                 "--probability", proxier.probability(numEndpoints-i))
@@ -322,9 +516,9 @@ func (proxier *Proxier) writeServiceToEndpointRules(natRules, svcPortNameString,
 }
 ```
 
-**로드밸런싱 규칙 예시 (3개 Endpoint):**
+**Example load-balancing rules (3 endpoints):**
 ```bash
-# KUBE-SVC-XXXXXXXX (Service 체인)
+# KUBE-SVC-XXXXXXXX (Service chain)
 -A KUBE-SVC-XXXXXXXX -m statistic --mode random --probability 0.33333333349 \
    -j KUBE-SEP-AAAAAAAAAAAA   # Pod A (33%)
 -A KUBE-SVC-XXXXXXXX -m statistic --mode random --probability 0.50000000000 \
@@ -332,19 +526,60 @@ func (proxier *Proxier) writeServiceToEndpointRules(natRules, svcPortNameString,
 -A KUBE-SVC-XXXXXXXX \
    -j KUBE-SEP-CCCCCCCCCCCC   # Pod C (100% of remaining = 33%)
 
-# KUBE-SEP-AAAAAAAAAAAA (Endpoint 체인) - DNAT
+# KUBE-SEP-AAAAAAAAAAAA (Endpoint chain) - DNAT
 -A KUBE-SEP-AAAAAAAAAAAA -m comment --comment "default/nginx" \
-   -s 10.244.0.2 -j KUBE-MARK-MASQ   # 자기 자신에서 오는 요청 마스커레이드
+   -s 10.244.0.2 -j KUBE-MARK-MASQ   # masquerade requests coming from itself
 -A KUBE-SEP-AAAAAAAAAAAA -m tcp -p tcp \
    -j DNAT --to-destination 10.244.0.2:8080   # DNAT
 ```
 
-#### 4.5 iptables-restore 원자적 적용
+**Why those odd probabilities (0.333, 0.5, 1.0)?**
+iptables has no built-in "pick one of N at random" action. It only evaluates
+rules **top to bottom**, each rule being "with probability *p*, jump; otherwise
+fall through to the next rule." To make three endpoints each get an equal 1/3
+share with that sequential model, kube-proxy uses **conditional** probabilities —
+the `i`-th rule uses `1/(numEndpoints - i)`:
+
+| Rule | Probability used | Chance of *reaching* this rule | Overall share |
+| --- | --- | --- | --- |
+| 1st (Pod A) | `1/3 ≈ 0.333` | 100% | 1/3 |
+| 2nd (Pod B) | `1/2 = 0.5` | 2/3 (A didn't match) | 2/3 × 1/2 = 1/3 |
+| 3rd (Pod C) | none (always jump) | 1/3 (A and B didn't match) | 1/3 |
+
+The last endpoint has **no** `--probability` (it is the unconditional catch-all),
+which guarantees that *some* endpoint is always chosen. This is why the code only
+adds the `statistic` match when `i < numEndpoints-1`.
+
+> ⚠️ This is **per-packet** randomness, but a connection does **not** flip
+> between Pods. Only the very first packet (the SYN) runs the random gauntlet;
+> conntrack then records the chosen Pod and every later packet of that connection
+> is translated to the same Pod automatically. Load balancing is therefore
+> per-connection, not per-packet.
+
+**The two lines inside a `KUBE-SEP-*` (per-endpoint) chain:**
+
+- `-s 10.244.0.2 -j KUBE-MARK-MASQ` — *if the request's **source** is the
+  endpoint Pod itself*, mark it for masquerade (SNAT). This handles the
+  "hairpin" case where a Pod reaches a Service that load-balances back to that
+  same Pod; without the SNAT the Pod would see its own IP as both source and
+  destination and the reply would never come back.
+- `-j DNAT --to-destination 10.244.0.2:8080` — the actual destination rewrite:
+  send the packet to this Pod's real IP and port. This is the line that makes the
+  virtual ClusterIP "become" a real Pod.
+
+**Session affinity (`-m recent`).** When a Service sets
+`sessionAffinity: ClientIP`, kube-proxy adds a rule *before* the random rules
+that uses the kernel `recent` module to remember which endpoint a given client IP
+was last sent to (`--rcheck` within `--seconds <StickyMaxAgeSeconds>`). A
+returning client skips load balancing and is pinned to the same endpoint chain,
+so all of one client's connections land on the same Pod until the timer expires.
+
+#### 4.5 Atomic Application via iptables-restore
 
 ```go
-// 라인 1250+: 규칙 버퍼를 iptables-restore에 전달
+// Lines 1250+: hand the rule buffer to iptables-restore
 proxier.iptablesData.Reset()
-// 체인 정의 + 규칙을 단일 버퍼에 작성
+// Write chain definitions + rules into a single buffer
 // └─ *filter
 // └─ :KUBE-FORWARD - [0:0]
 // └─ -A KUBE-FORWARD ...
@@ -353,45 +588,45 @@ proxier.iptablesData.Reset()
 // └─ ...
 
 err := proxier.iptables.Restore(table, proxier.iptablesData.Bytes(), ...)
-// └─ iptables-restore --noflush --counters 실행
-// └─ 원자적 적용: 중간 상태 없음
+// └─ executes iptables-restore --noflush --counters
+// └─ atomic application: no intermediate state
 ```
 
 ---
 
-## [5] 실제 패킷 흐름
+## [5] Actual Packet Flow
 
-### ClusterIP 접근 시
+### Accessing a ClusterIP
 
 ```
 Pod A (10.244.0.2) → Service ClusterIP (10.0.0.1:80)
 
-1. SYN 패킷: 10.244.0.2:12345 → 10.0.0.1:80
+1. SYN packet: 10.244.0.2:12345 → 10.0.0.1:80
    │
    └─ PREROUTING (NAT)
       └─ KUBE-SERVICES
          └─ "-d 10.0.0.1 --dport 80 -j KUBE-SVC-ABC"
             │
-            └─ KUBE-SVC-ABC (로드밸런싱)
+            └─ KUBE-SVC-ABC (load balancing)
                └─ "-m statistic --probability 0.333 -j KUBE-SEP-POD-B"
                   │
                   └─ KUBE-SEP-POD-B
                      └─ DNAT: 10.0.0.1:80 → 10.244.0.3:8080
                         │
-                        └─ 라우팅: Pod B로 전달
+                        └─ Routing: forwarded to Pod B
 
-2. conntrack에 기록:
+2. Recorded in conntrack:
    src=10.244.0.2 dst=10.244.0.3 sport=12345 dport=8080 [ESTABLISHED]
 
-3. 응답: 10.244.0.3:8080 → 10.244.0.2:12345 (conntrack이 역변환)
+3. Response: 10.244.0.3:8080 → 10.244.0.2:12345 (conntrack reverses the translation)
 ```
 
-### NodePort 접근 시
+### Accessing a NodePort
 
 ```
-외부 클라이언트 (203.0.113.5) → NodeIP:30001
+External client (203.0.113.5) → NodeIP:30001
 
-1. 패킷: 203.0.113.5:54321 → 192.168.1.10:30001
+1. Packet: 203.0.113.5:54321 → 192.168.1.10:30001
    │
    └─ INPUT (NAT)
       └─ KUBE-NODE-PORTS
@@ -399,33 +634,33 @@ Pod A (10.244.0.2) → Service ClusterIP (10.0.0.1:80)
             │
             └─ KUBE-EXT-ABC
                └─ (externalTrafficPolicy=Cluster) → KUBE-SVC-ABC
-                  └─ DNAT + 마스커레이드
+                  └─ DNAT + masquerade
 
-2. 마스커레이드 (Source NAT):
-   외부 클라이언트 IP를 노드 IP로 교체
-   (Pod가 응답을 올바른 노드로 돌려보내기 위함)
+2. Masquerade (Source NAT):
+   Replace the external client IP with the node IP
+   (so the Pod sends responses back to the correct node)
 ```
 
 ---
 
-## 변경 추적 구조
+## Change-Tracking Structures
 
 ### ServiceChangeTracker
 
-**파일:** [pkg/proxy/servicechangetracker.go](../pkg/proxy/servicechangetracker.go#L31)
+**File:** [pkg/proxy/servicechangetracker.go](../pkg/proxy/servicechangetracker.go#L31)
 
 ```go
-// 변경이 누적될 때까지 pending 상태 유지
+// Stays pending until changes are accumulated
 type serviceChange struct {
-    previous ServicePortMap  // 이전 상태
-    current  ServicePortMap  // 현재 상태
+    previous ServicePortMap  // previous state
+    current  ServicePortMap  // current state
 }
 
-// Update 시 delta만 기록 (변경 없으면 제거)
+// On Update, only the delta is recorded (removed if there is no change)
 func (sct *ServiceChangeTracker) Update(previous, current *v1.Service) bool {
     if reflect.DeepEqual(change.previous, change.current) {
         delete(sct.items, namespacedName)
-        return false  // 실제 변경 없음
+        return false  // no actual change
     }
     return true
 }
@@ -433,7 +668,7 @@ func (sct *ServiceChangeTracker) Update(previous, current *v1.Service) bool {
 
 ### EndpointSliceCache
 
-**파일:** [pkg/proxy/endpointslicecache.go](../pkg/proxy/endpointslicecache.go#L34)
+**File:** [pkg/proxy/endpointslicecache.go](../pkg/proxy/endpointslicecache.go#L34)
 
 ```go
 type EndpointSliceCache struct {
@@ -441,8 +676,8 @@ type EndpointSliceCache struct {
 }
 
 type endpointSliceTracker struct {
-    applied endpointSliceDataByName  // 이미 iptables에 적용된 슬라이스
-    pending endpointSliceDataByName  // 다음 syncProxyRules에서 적용될 슬라이스
+    applied endpointSliceDataByName  // slices already applied to iptables
+    pending endpointSliceDataByName  // slices to be applied in the next syncProxyRules
 }
 ```
 
@@ -450,57 +685,71 @@ type endpointSliceTracker struct {
 
 ## Partial Sync vs Full Sync
 
-| 항목 | Partial Sync | Full Sync |
+| Aspect | Partial Sync | Full Sync |
 |------|-------------|-----------|
-| 언제 | 개별 Service/Endpoint 변경 시 | 주기적(기본 30분) 또는 외부 수정 감지 시 |
-| 범위 | 변경된 Service 체인만 업데이트 | 모든 규칙 재생성 |
-| 점프 규칙 | 재생성 안 함 | 재생성 |
-| 성능 | 빠름 | 느리지만 일관성 보장 |
+| When | On individual Service/Endpoint changes | Periodically (default 30 min) or when external modification is detected |
+| Scope | Updates only the changed Service chains | Regenerates all rules |
+| Jump rules | Not regenerated | Regenerated |
+| Performance | Fast | Slower, but guarantees consistency |
 
-**Large Cluster Mode (1000개 이상 Endpoint):**
-- 전체 동기화 주기 늘림
-- 메모리 효율 최적화
+**Large Cluster Mode (1000+ endpoints):**
+- Increases the full sync period
+- Optimizes memory efficiency
 
 ---
 
-## 주요 iptables 체인 구조
+## Key iptables Chain Structure
 
 ```
 NAT table:
 
-PREROUTING ──→ KUBE-SERVICES ──→ KUBE-SVC-{hash}    (ClusterIP 트래픽)
-OUTPUT     ──→                └──→ KUBE-EXT-{hash}    (외부 트래픽 + NodePort)
+PREROUTING ──→ KUBE-SERVICES ──→ KUBE-SVC-{hash}    (ClusterIP traffic)
+OUTPUT     ──→                └──→ KUBE-EXT-{hash}    (external traffic + NodePort)
                               └──→ KUBE-FW-{hash}     (LoadBalancer with source range)
 
-KUBE-SVC-{hash} ──→ KUBE-SEP-{hash}  (각 Endpoint 체인, DNAT 수행)
+KUBE-SVC-{hash} ──→ KUBE-SEP-{hash}  (per-Endpoint chain, performs DNAT)
 
-POSTROUTING ──→ KUBE-POSTROUTING ──→ KUBE-MARK-MASQ (마스커레이드)
+POSTROUTING ──→ KUBE-POSTROUTING ──→ KUBE-MARK-MASQ (masquerade)
 
 Filter table:
 
-FORWARD ──→ KUBE-FORWARD   (Pod 간 트래픽 허용)
-INPUT   ──→ KUBE-NODE-PORTS (NodePort 트래픽 허용)
+FORWARD ──→ KUBE-FORWARD   (allow Pod-to-Pod traffic)
+INPUT   ──→ KUBE-NODE-PORTS (allow NodePort traffic)
 ```
 
 ---
 
-## 핵심 파일 경로 요약
+## Key File Path Summary
 
-| 단계 | 파일 | 핵심 함수 | 라인 |
+| Step | File | Key Function | Line |
 |------|------|----------|------|
-| Endpoint 컨트롤러 | [pkg/controller/endpoint/endpoints_controller.go](../pkg/controller/endpoint/endpoints_controller.go) | `syncService` | 334 |
-| EndpointSlice 컨트롤러 | [pkg/controller/endpointslice/endpointslice_controller.go](../pkg/controller/endpointslice/endpointslice_controller.go) | `NewController` | 84 |
-| kube-proxy 시작 | [cmd/kube-proxy/app/server.go](../cmd/kube-proxy/app/server.go) | `newProxyServer` | 183 |
+| Endpoint controller | [pkg/controller/endpoint/endpoints_controller.go](../pkg/controller/endpoint/endpoints_controller.go) | `syncService` | 334 |
+| EndpointSlice controller | [pkg/controller/endpointslice/endpointslice_controller.go](../pkg/controller/endpointslice/endpointslice_controller.go) | `NewController` | 84 |
+| kube-proxy startup | [cmd/kube-proxy/app/server.go](../cmd/kube-proxy/app/server.go) | `newProxyServer` | 183 |
 | iptables Proxier | [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go) | `NewProxier` | 214 |
-| Watch 콜백 | [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go) | `OnServiceUpdate`, `OnEndpointSliceAdd` | 459 |
-| 규칙 생성 핵심 | [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go) | `syncProxyRules` | 638 |
-| 로드밸런싱 규칙 | [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go) | `writeServiceToEndpointRules` | 1446 |
-| Service 변경 추적 | [pkg/proxy/servicechangetracker.go](../pkg/proxy/servicechangetracker.go) | `Update` | 76 |
-| EndpointSlice 캐시 | [pkg/proxy/endpointslicecache.go](../pkg/proxy/endpointslicecache.go) | `checkoutChanges` | 122 |
+| Watch callbacks | [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go) | `OnServiceUpdate`, `OnEndpointSliceAdd` | 459 |
+| Core rule generation | [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go) | `syncProxyRules` | 638 |
+| Load-balancing rules | [pkg/proxy/iptables/proxier.go](../pkg/proxy/iptables/proxier.go) | `writeServiceToEndpointRules` | 1446 |
+| Service change tracking | [pkg/proxy/servicechangetracker.go](../pkg/proxy/servicechangetracker.go) | `Update` | 76 |
+| EndpointSlice cache | [pkg/proxy/endpointslicecache.go](../pkg/proxy/endpointslicecache.go) | `checkoutChanges` | 122 |
 
 ---
 
-## 관련 시나리오
+## Related Concepts
 
-- [시나리오 4: kubelet Pod 라이프사이클](04-kubelet-pod-lifecycle.md) — readinessProbe가 Endpoint 상태에 영향
-- [시나리오 1: API 요청 흐름](01-api-request-flow.md) — Service 객체가 저장되는 흐름
+- **A Service is a virtual IP, not a process.** A ClusterIP is bound to no interface and answers no pings on its own; it exists *only* as iptables/IPVS/nftables rules that rewrite packet destinations. Nothing is "listening" at the VIP.
+- **kube-proxy modes.** `iptables` (rule-based, the common default), `ipvs` (kernel hash tables, scales to many Services), and `nftables` (the modern successor) all implement the same `proxy.Provider` interface — only the data-plane mechanism differs.
+- **Endpoints vs. EndpointSlice.** EndpointSlice replaces the single, monolithic Endpoints object by sharding backends (≤100 per slice) and adding zone/topology hints — the basis for scalability and topology-aware routing.
+- **conntrack, DNAT, and SNAT/masquerade.** The first packet of a connection is **DNAT**'d to a chosen Pod and recorded in **conntrack**, so the whole flow sticks to that Pod; **masquerade** (SNAT) rewrites the source IP when needed so replies route back correctly.
+- **`externalTrafficPolicy` / `internalTrafficPolicy`.** `Local` keeps traffic on node-local endpoints, preserving the client source IP and skipping an extra hop; `Cluster` spreads load across all endpoints at the cost of an SNAT and a possible second hop.
+- **Service type layering.** ClusterIP → NodePort → LoadBalancer build on each other, which is exactly the chain order you see in iptables: `KUBE-SERVICES` → `KUBE-EXT-*` (NodePort/external) → `KUBE-FW-*` (LoadBalancer source ranges).
+- **Headless Services & DNS.** A Service with `clusterIP: None` skips proxying entirely; DNS returns the Pod IPs directly, which is how StatefulSets give each Pod a stable name.
+
+> ⚠️ **kube-proxy doesn't sit in the data path.** It only *programs* kernel rules; the kernel then forwards packets with no per-packet userspace hop. If traffic breaks, inspect the rules it wrote (`iptables-save`), not a kube-proxy "connection."
+
+---
+
+## Related Scenarios
+
+- [Scenario 4: kubelet Pod Lifecycle](04-kubelet-pod-lifecycle.md) — readinessProbe affects Endpoint state
+- [Scenario 1: API Request Flow](01-api-request-flow.md) — the flow in which the Service object is stored

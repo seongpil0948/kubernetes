@@ -1,55 +1,87 @@
-# 시나리오 3: Deployment 롤링 업데이트
+# Scenario 3: Deployment Rolling Update
 
-`kubectl apply` 후 Deployment가 변경될 때 컨트롤러가 ReplicaSet을 생성/수정하고 Pod를 교체하는 흐름을 추적합니다.
+Traces the flow in which, after `kubectl apply`, the controller creates/modifies ReplicaSets and replaces Pods when a Deployment changes.
 
-## 전체 흐름도
+## Big Picture
+
+Rolling update is a reconciliation loop over two ReplicaSet groups: the new-template RS and old-template RSs. The Deployment controller continuously adjusts both sides to satisfy availability constraints (`maxSurge`, `maxUnavailable`), while the ReplicaSet controller performs the actual Pod create/delete operations.
+
+## Interface and Indirection Guide (This Scenario)
+
+This path uses less classic interface polymorphism and more controller indirection. Use this order:
+1. Identify function-field indirection (`syncHandler`) and find its assignment.
+2. Follow typed clients/listers to concrete API calls (`AppsV1().ReplicaSets().Create/Update`).
+3. Confirm queue-driven re-entry points (`processNextWorkItem` -> sync function).
+4. Treat controller ownership (`OwnerReferences`, adoption) as runtime dispatch logic for which object gets reconciled.
+
+### Worked Example: `controller.PodControlInterface` -> `controller.RealPodControl`
+
+The Deployment controller itself scales ReplicaSets, but the ReplicaSet controller uses this interface to do the Pod-level work:
+
+1. Interface: `type PodControlInterface interface` in [../pkg/controller/controller_utils.go](../pkg/controller/controller_utils.go#L470).
+2. Compile-time proof: `var _ PodControlInterface = &RealPodControl{}` in [../pkg/controller/controller_utils.go](../pkg/controller/controller_utils.go#L488).
+3. Factory-style wiring: `NewReplicaSetController(...)` passes a concrete `controller.RealPodControl{...}` into `NewBaseController(...)` in [../pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go#L155) and [../pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go#L191).
+4. Assignment wiring: `NewBaseController(...)` stores that value in `rsc.podControl` in [../pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go#L205).
+5. Runtime call sites: `manageReplicas()` executes `rsc.podControl.CreatePods(...)` and `DeletePod(...)` in [../pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go#L678) and [../pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go#L726).
+
+This is a good example of why wiring matters: many types could satisfy the interface, but this rollout path actually uses `RealPodControl`, which turns desired replica changes into real Pod create/delete API calls.
+
+## Reading Guide (Beginner)
+
+- **Trigger:** Deployment spec/template change or ReplicaSet/Pod change event requeues the Deployment key.
+- **What the controller directly changes:** only ReplicaSet replica counts and Deployment status.
+- **Where Pods are really created/deleted:** ReplicaSet controller performs Pod-level actions.
+- **Success criterion for this scenario:** new ReplicaSet reaches desired replicas while old ReplicaSets scale down within rollout limits.
+- **Most common confusion:** one sync does not finish a rollout; it converges over many queue iterations.
+
+## Overall Flow Diagram
 
 ```
 kubectl apply -f deployment-v2.yaml
         │
-[1] API 서버에 Deployment 업데이트 저장
-        │ (Watch 이벤트)
+[1] Deployment update stored in API server
+        │ (Watch event)
         ▼
 [2] pkg/controller/deployment/deployment_controller.go
-    updateDeployment() → WorkQueue에 key 추가
+    updateDeployment() → add key to WorkQueue
         │
         ▼
-[3] syncDeployment() — 전략 분기
+[3] syncDeployment() — strategy branch
         │
         ├─ d.Spec.Strategy.Type == RollingUpdate
         │          ↓
 [4] rolling.go:rolloutRolling()
         │
         ├─ [4a] getAllReplicaSetsAndSyncRevision()
-        │        새 RS 없으면 생성 (sync.go:getNewReplicaSet)
+        │        create new RS if absent (sync.go:getNewReplicaSet)
         │
         ├─ [4b] reconcileNewReplicaSet()
-        │        새 RS scale up
+        │        scale up new RS
         │
         ├─ [4c] reconcileOldReplicaSets()
-        │        기존 RS scale down
+        │        scale down old RSs
         │
         └─ [4d] syncRolloutStatus()
-                 Deployment 상태 업데이트
+                 update Deployment status
         │
-        ▼ (ReplicaSet.Spec.Replicas 변경)
+        ▼ (ReplicaSet.Spec.Replicas changed)
 [5] pkg/controller/replicaset/replica_set.go
     syncReplicaSet() → manageReplicas()
         │
-        ├─ diff < 0: slowStartBatch()로 Pod 생성
-        └─ diff > 0: 병렬 Pod 삭제
+        ├─ diff < 0: create Pods via slowStartBatch()
+        └─ diff > 0: delete Pods in parallel
 ```
 
 ---
 
-## 단계별 상세 분석
+## Step-by-Step Detailed Analysis
 
-### [2] DeploymentController 초기화 및 이벤트 처리
+### [2] DeploymentController Initialization and Event Handling
 
-**파일:** [pkg/controller/deployment/deployment_controller.go](../pkg/controller/deployment/deployment_controller.go#L104)
+**File:** [pkg/controller/deployment/deployment_controller.go](../pkg/controller/deployment/deployment_controller.go#L104)
 
 ```go
-// 라인 104-168: NewDeploymentController()
+// Lines 104-168: NewDeploymentController()
 func NewDeploymentController(ctx, dInformer, rsInformer, podInformer, client) (*DeploymentController, error) {
     dc := &DeploymentController{
         client:        client,
@@ -59,184 +91,221 @@ func NewDeploymentController(ctx, dInformer, rsInformer, podInformer, client) (*
         queue:         workqueue.NewTypedRateLimitingQueue(...),
     }
 
-    // Informer 이벤트 핸들러 등록 (라인 131-167)
+    // Register informer event handlers (lines 131-167)
     dInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-        AddFunc:    dc.addDeployment,    // 라인 201: 큐에 추가
-        UpdateFunc: dc.updateDeployment, // 라인 207: 큐에 추가
+        AddFunc:    dc.addDeployment,    // Line 201: add to queue
+        UpdateFunc: dc.updateDeployment, // Line 207: add to queue
         DeleteFunc: dc.deleteDeployment,
     })
 }
 ```
 
-**처리 루프:**
+**Processing loop:**
 ```go
-// 라인 481-484: worker()
+// Lines 481-484: worker()
 func (dc *DeploymentController) worker(ctx context.Context) {
     for dc.processNextWorkItem(ctx) {}
 }
 
-// 라인 486-497: processNextWorkItem()
+// Lines 486-497: processNextWorkItem()
 key, _ := dc.queue.Get()
-dc.syncHandler(ctx, key.(string))  // syncDeployment() 호출
+dc.syncHandler(ctx, key.(string))  // calls syncDeployment()
 ```
+
+> ⚠️ **`syncHandler` is a function field, not a hard-coded call.** It is declared as `syncHandler func(ctx context.Context, dKey string) error` ([deployment_controller.go:76](../pkg/controller/deployment/deployment_controller.go#L76)) and wired in the constructor with `dc.syncHandler = dc.syncDeployment` ([deployment_controller.go:152](../pkg/controller/deployment/deployment_controller.go#L152)). This is the function-pointer form of dependency injection: to find what actually runs, grep for where the field is **assigned** (here, `syncDeployment` at line 574), not where it is called. Controllers use this indirection so tests can swap in a fake sync function.
 
 ---
 
-### [3] syncDeployment() — 전략 분기
+### [3] syncDeployment() — Strategy Branch
 
-**파일:** [pkg/controller/deployment/deployment_controller.go](../pkg/controller/deployment/deployment_controller.go#L574)
+**File:** [pkg/controller/deployment/deployment_controller.go](../pkg/controller/deployment/deployment_controller.go#L574)
 
 ```go
-// 라인 574-660: syncDeployment()
+// Lines 574-660: syncDeployment()
 func (dc *DeploymentController) syncDeployment(ctx context.Context, key string) error {
 
-    // 라인 588: Deployment 조회
+    // Line 588: look up the Deployment
     deployment, err := dc.dLister.Deployments(namespace).Get(name)
 
-    // 라인 612: RS 목록 조회 및 orphan RS 주장
+    // Line 612: list RSs and adopt orphan RSs
     rsList, err := dc.getReplicaSetsForDeployment(ctx, d)
 
-    // 라인 617: 삭제 중인 경우
+    // Line 617: being deleted
     if d.DeletionTimestamp != nil {
         return dc.syncStatusOnly(ctx, d, rsList)
     }
 
-    // 라인 628: 일시정지 상태
+    // Line 628: paused state
     if d.Spec.Paused {
         return dc.sync(ctx, d, rsList)
     }
 
-    // 라인 635: 롤백 요청
+    // Line 635: rollback requested
     if getRollbackTo(d) != nil {
         return dc.rollback(ctx, d, rsList)
     }
 
-    // 라인 639: 단순 스케일링 이벤트
+    // Line 639: simple scaling event
     scalingEvent, err := dc.isScalingEvent(ctx, d, rsList)
     if scalingEvent {
         return dc.sync(ctx, d, rsList)
     }
 
-    // 라인 647-658: 전략 분기
+    // Lines 647-658: strategy branch
     switch d.Spec.Strategy.Type {
     case apps.RecreateDeploymentStrategyType:
         return dc.rolloutRecreate(ctx, d, rsList, podMap)
     case apps.RollingUpdateDeploymentStrategyType:
-        return dc.rolloutRolling(ctx, d, rsList)  // ← 롤링 업데이트
+        return dc.rolloutRolling(ctx, d, rsList)  // ← rolling update
     }
 }
 ```
 
 ---
 
-### [4] rolloutRolling() — 롤링 업데이트 핵심
+### Concept Primer: `maxSurge` and `maxUnavailable`
 
-**파일:** [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go#L31)
+Before reading the rolling-update code, you need the two knobs that drive every
+calculation in it. Both live under `spec.strategy.rollingUpdate` and can be an
+absolute number or a percentage of `spec.replicas`:
+
+- **`maxSurge`** — how many **extra** Pods, *above* the desired count, may exist
+  during a rollout. It controls how aggressively the **new** ReplicaSet is
+  allowed to scale **up**. With `replicas: 10, maxSurge: 2`, the controller may
+  run up to 12 Pods at once.
+- **`maxUnavailable`** — how many Pods, *below* the desired count, are allowed to
+  be **unavailable** during a rollout. It controls how aggressively the **old**
+  ReplicaSet is allowed to scale **down**. With `replicas: 10, maxUnavailable: 2`,
+  at least 8 Pods must stay Ready at all times.
+
+Together they define a window the total Pod count must stay inside for the whole
+rollout:
+
+```
+desired - maxUnavailable  ≤  Ready Pods  ≤  desired + maxSurge
+        (8)                                       (12)
+```
+
+The entire rolling update is just the controller nudging the new RS up and the
+old RS down, one step at a time, **without ever leaving that window** — which is
+why no single sync finishes the rollout (see "Most common confusion" above). The
+formulas in [4b]/[4c] (`NewRSNewReplicas`, `maxScaledDown`) are simply this
+window expressed in code.
+
+> ⚠️ `maxSurge` and `maxUnavailable` cannot **both** be 0 — that would leave no
+> room to either add a new Pod or remove an old one, so the rollout could never
+> make progress. The API validation rejects that combination.
+
+---
+
+### [4] rolloutRolling() — Rolling Update Core
+
+**File:** [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go#L31)
 
 ```go
-// 라인 31-66: rolloutRolling()
+// Lines 31-66: rolloutRolling()
 func (dc *DeploymentController) rolloutRolling(ctx, d, rsList) error {
 
-    // 라인 32: 새 RS 조회 또는 생성
+    // Line 32: look up or create the new RS
     newRS, oldRSs, err := dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, true)
     allRSs := append(oldRSs, newRS)
 
-    // 라인 39: 새 RS scale up
+    // Line 39: scale up new RS
     scaledUp, err := dc.reconcileNewReplicaSet(ctx, allRSs, newRS, d)
 
-    // 라인 49: 기존 RS scale down
+    // Line 49: scale down old RSs
     scaledDown, err := dc.reconcileOldReplicaSets(ctx, allRSs,
         controller.FilterActiveReplicaSets(oldRSs), newRS, d)
 
-    // 라인 58: 완료 시 cleanup (RevisionHistoryLimit 적용)
+    // Line 58: cleanup on completion (applies RevisionHistoryLimit)
     if deploymentutil.DeploymentComplete(d, &d.Status) {
         dc.cleanupDeployment(ctx, oldRSs, d)
     }
 
-    // 라인 65: 상태 업데이트
+    // Line 65: update status
     return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
 }
 ```
 
 ---
 
-### [4a] 새 ReplicaSet 생성
+### [4a] Creating the New ReplicaSet
 
-**파일:** [pkg/controller/deployment/sync.go](../pkg/controller/deployment/sync.go#L146)
+**File:** [pkg/controller/deployment/sync.go](../pkg/controller/deployment/sync.go#L146)
 
 ```go
-// 라인 146-300: getNewReplicaSet()
+// Lines 146-300: getNewReplicaSet()
 func (dc *DeploymentController) getNewReplicaSet(ctx, d, rsList, ...) (*apps.ReplicaSet, error) {
 
-    // 라인 148: PodTemplateHash 기반으로 기존 RS 탐색
+    // Line 148: find existing RS based on PodTemplateHash
     existingNewRS := deploymentutil.FindNewReplicaSet(d, rsList)
     if existingNewRS != nil {
-        // 라인 160: 기존 RS 어노테이션/revision 업데이트
+        // Line 160: update annotations/revision of the existing RS
         return updatedRS, nil
     }
 
-    // 라인 196-232: 새 RS 생성
+    // Lines 196-232: create new RS
     newRS := apps.ReplicaSet{
         ObjectMeta: metav1.ObjectMeta{
-            // 라인 207: 이름 = deployment명 + pod template hash
+            // Line 207: name = deployment name + pod template hash
             Name:            generateReplicaSetName(d.Name, podTemplateSpecHash),
             OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(d, controllerKind)},
         },
         Spec: apps.ReplicaSetSpec{
-            Replicas: new(int32),  // 초기값 계산
+            Replicas: new(int32),  // initial value computed below
             Template: newRSTemplate,
         },
     }
 
-    // 라인 220: 초기 replicas 수 계산 (maxSurge 고려)
+    // Line 220: compute initial replica count (accounting for maxSurge)
     newReplicasCount, err := deploymentutil.NewRSNewReplicas(d, allRSs, &newRS)
 
-    // 라인 232: API 서버에 RS 생성
+    // Line 232: create the RS in the API server
     createdRS, err := dc.client.AppsV1().ReplicaSets(d.Namespace).Create(ctx, &newRS, ...)
 }
 ```
 
-**Hash 충돌 처리 (라인 233-268):**
+**Hash collision handling (lines 233-268):**
 ```go
 case errors.IsAlreadyExists(err):
-    // 같은 이름이지만 다른 Deployment 소유이거나 template이 다른 경우
-    // d.Status.CollisionCount++ 후 재시도
+    // Same name but owned by a different Deployment, or template differs
+    // d.Status.CollisionCount++ then retry
 ```
 
-**초기 Replicas 계산 (NewRSNewReplicas):**
+**Initial replicas calculation (NewRSNewReplicas):**
 
-**파일:** [pkg/controller/deployment/util/deployment_util.go](../pkg/controller/deployment/util/deployment_util.go#L817)
+**File:** [pkg/controller/deployment/util/deployment_util.go](../pkg/controller/deployment/util/deployment_util.go#L817)
 
 ```go
-// 라인 817-842: NewRSNewReplicas()
-// 공식:
+// Lines 817-842: NewRSNewReplicas()
+// Formula:
 maxTotalPods := desired + maxSurge
 scaleUpCount := maxTotalPods - currentTotal
-// 새 RS replicas = 기존값 + min(scaleUpCount, desired-newRS현재값)
+// new RS replicas = current value + min(scaleUpCount, desired - newRS current value)
 ```
 
 ---
 
-### [4b] 새 RS Scale Up
+### [4b] Scaling Up the New RS
 
-**파일:** [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go#L68)
+**File:** [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go#L68)
 
 ```go
-// 라인 68-84: reconcileNewReplicaSet()
+// Lines 68-84: reconcileNewReplicaSet()
 func (dc *DeploymentController) reconcileNewReplicaSet(ctx, allRSs, newRS, d) (bool, error) {
 
-    // 이미 desired 수 달성
+    // already at desired count
     if *(newRS.Spec.Replicas) == *(d.Spec.Replicas) {
         return false, nil
     }
 
-    // 초과 (surge 때문에)
+    // over desired (due to surge)
     if *(newRS.Spec.Replicas) > *(d.Spec.Replicas) {
         scaled, _, err := dc.scaleReplicaSet(ctx, newRS, *(d.Spec.Replicas), d, false)
         return scaled, err
     }
 
-    // scale up 수 계산 후 적용
+    // compute scale-up count and apply
     newReplicasCount, err := deploymentutil.NewRSNewReplicas(d, allRSs, newRS)
     scaled, _, err := dc.scaleReplicaSet(ctx, newRS, newReplicasCount, d, false)
     return scaled, err
@@ -245,60 +314,60 @@ func (dc *DeploymentController) reconcileNewReplicaSet(ctx, allRSs, newRS, d) (b
 
 ---
 
-### [4c] 기존 RS Scale Down
+### [4c] Scaling Down the Old RSs
 
-**파일:** [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go#L86)
+**File:** [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go#L86)
 
 ```go
-// 라인 86-152: reconcileOldReplicaSets()
+// Lines 86-152: reconcileOldReplicaSets()
 func (dc *DeploymentController) reconcileOldReplicaSets(ctx, allRSs, oldRSs, newRS, d) (bool, error) {
 
     oldPodsCount := deploymentutil.GetReplicaCountForReplicaSets(oldRSs)
     if oldPodsCount == 0 { return false, nil }
 
-    // 라인 95: maxUnavailable 계산
+    // Line 95: compute maxUnavailable
     maxUnavailable := deploymentutil.MaxUnavailable(*d)
 
-    // 안전하게 내릴 수 있는 Pod 수 계산
+    // compute how many Pods can be safely scaled down
     minAvailable := *(d.Spec.Replicas) - maxUnavailable
     newRSUnavailablePodCount := *(newRS.Spec.Replicas) - newRS.Status.AvailableReplicas
     maxScaledDown := allPodsCount - minAvailable - newRSUnavailablePodCount
 
     if maxScaledDown <= 0 { return false, nil }
 
-    // 라인 136: unhealthy Pod 먼저 제거
+    // Line 136: remove unhealthy Pods first
     oldRSs, cleanupCount, _ := dc.cleanupUnhealthyReplicas(ctx, oldRSs, d, maxScaledDown)
 
-    // 라인 144: 나머지 안전하게 scale down
+    // Line 144: safely scale down the rest
     scaledDownCount, _ := dc.scaleDownOldReplicaSetsForRollingUpdate(ctx, allRSs, oldRSs, d)
 }
 ```
 
-**Scale Down 안전성 공식:**
+**Scale down safety formula:**
 ```
 minAvailable  = desiredReplicas - maxUnavailable
 maxScaledDown = totalPods - minAvailable - newRS_unavailable
 
-항상 minAvailable 이상의 Pod가 Ready 상태를 유지
+At least minAvailable Pods always remain Ready
 ```
 
-**Scale Down 예시 (replicas=10, maxSurge=2, maxUnavailable=2):**
+**Scale down example (replicas=10, maxSurge=2, maxUnavailable=2):**
 ```
 t=0s: oldRS=10, newRS=0   → newRS scale up: 2 (maxSurge)
 t=1s: oldRS=10, newRS=2   → oldRS scale down: 2 (minAvail=8, total=12)
-t=2s: oldRS=8,  newRS=2   → newRS scale up: 2 더
-t=3s: oldRS=8,  newRS=4   → oldRS scale down: 2 더
+t=2s: oldRS=8,  newRS=2   → newRS scale up: 2 more
+t=3s: oldRS=8,  newRS=4   → oldRS scale down: 2 more
 ...
-t=Ns: oldRS=0,  newRS=10  → 완료
+t=Ns: oldRS=0,  newRS=10  → complete
 ```
 
-**unhealthy 우선 제거 (라인 155-189):**
+**Unhealthy-first removal (lines 155-189):**
 ```go
-// 라인 157: 생성 시간순 정렬 (오래된 것부터)
+// Line 157: sort by creation time (oldest first)
 sort.Sort(controller.ReplicaSetsByCreationTimestamp(oldRSs))
 
 for _, targetRS := range oldRSs {
-    // unhealthy Pod 수 = Spec.Replicas - Status.AvailableReplicas
+    // unhealthy Pod count = Spec.Replicas - Status.AvailableReplicas
     scaledDownCount := min(maxCleanupCount-totalScaledDown,
         *(targetRS.Spec.Replicas) - targetRS.Status.AvailableReplicas)
     dc.scaleReplicaSet(ctx, targetRS, *(targetRS.Spec.Replicas)-scaledDownCount, ...)
@@ -307,37 +376,37 @@ for _, targetRS := range oldRSs {
 
 ---
 
-### [5] ReplicaSetController — Pod 생성/삭제
+### [5] ReplicaSetController — Pod Creation/Deletion
 
-**파일:** [pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go#L649)
+**File:** [pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go#L649)
 
 ```go
-// 라인 649-750: manageReplicas()
+// Lines 649-750: manageReplicas()
 func (rsc *ReplicaSetController) manageReplicas(ctx, activePods, rs) error {
 
     diff := len(activePods) - int(*(rs.Spec.Replicas))
 
-    if diff < 0 {  // Pod 부족 → 생성
+    if diff < 0 {  // not enough Pods → create
         diff *= -1
-        if diff > rsc.burstReplicas { diff = rsc.burstReplicas }  // 최대 500개
+        if diff > rsc.burstReplicas { diff = rsc.burstReplicas }  // max 500
 
-        rsc.expectations.ExpectCreations(logger, rsKey, diff)  // expectation 등록
+        rsc.expectations.ExpectCreations(logger, rsKey, diff)  // register expectation
 
-        // 라인 677: Slow-start 배치 생성
+        // Line 677: slow-start batch creation
         successfulCreations, err := slowStartBatch(diff, controller.SlowStartInitialBatchSize,
             func() error {
                 return rsc.podControl.CreatePods(ctx, rs.Namespace, &rs.Spec.Template, rs, ...)
             })
 
-    } else if diff > 0 {  // Pod 초과 → 삭제
+    } else if diff > 0 {  // too many Pods → delete
         if diff > rsc.burstReplicas { diff = rsc.burstReplicas }
 
-        // 라인 710: 삭제 순서 결정 (not-ready < ready, unscheduled < scheduled)
+        // Line 710: determine deletion order (not-ready < ready, unscheduled < scheduled)
         podsToDelete := getPodsToDelete(activePods, relatedPods, diff)
 
         rsc.expectations.ExpectDeletions(logger, rsKey, getPodKeys(podsToDelete))
 
-        // 라인 723: 병렬 삭제
+        // Line 723: parallel deletion
         var wg sync.WaitGroup
         wg.Add(diff)
         for _, pod := range podsToDelete {
@@ -351,71 +420,71 @@ func (rsc *ReplicaSetController) manageReplicas(ctx, activePods, rs) error {
 }
 ```
 
-**Slow-Start Batch 패턴 (라인 887-911):**
+**Slow-start batch pattern (lines 887-911):**
 ```
-배치 크기: 1 → 2 → 4 → 8 → 16 ...
-이유: 한 배치에서 에러 발생 시 그 크기만큼만 실패
-      → 전체 실패 Pod 수를 O(실패크기)로 제한
+Batch sizes: 1 → 2 → 4 → 8 → 16 ...
+Why: if a batch errors, only that batch size fails
+      → caps the total number of failed Pods at O(failure size)
 ```
 
-**Pod 삭제 우선순위 (getPodsToDelete):**
+**Pod deletion priority (getPodsToDelete):**
 ```
-1. Not-ready 먼저 (ready=false)
-2. Unscheduled 먼저 (nodeName="")
-3. Pending 먼저 (phase=Pending)
-4. 같은 노드에 관련 Pod 많은 것 먼저 (다양성 보장)
+1. Not-ready first (ready=false)
+2. Unscheduled first (nodeName="")
+3. Pending first (phase=Pending)
+4. Pods on nodes with more related Pods first (ensures diversity)
 ```
 
 ---
 
-### [4d] 롤아웃 상태 업데이트
+### [4d] Rollout Status Update
 
-**파일:** [pkg/controller/deployment/progress.go](../pkg/controller/deployment/progress.go#L36)
+**File:** [pkg/controller/deployment/progress.go](../pkg/controller/deployment/progress.go#L36)
 
 ```go
-// 라인 36-118: syncRolloutStatus()
+// Lines 36-118: syncRolloutStatus()
 func (dc *DeploymentController) syncRolloutStatus(ctx, allRSs, newRS, d) error {
     newStatus := calculateStatus(allRSs, newRS, d)
 
     switch {
-    // 라인 53: 완료
+    // Line 53: complete
     case DeploymentComplete(d, &newStatus):
         condition := NewDeploymentCondition(DeploymentProgressing,
             True, NewRSAvailableReason,
             "ReplicaSet has successfully progressed.")
 
-    // 라인 63: 진행 중
+    // Line 63: in progress
     case DeploymentProgressing(d, &newStatus):
         condition := NewDeploymentCondition(DeploymentProgressing,
             True, ReplicaSetUpdatedReason, "...")
 
-    // 라인 86: 타임아웃
+    // Line 86: timed out
     case DeploymentTimedOut(ctx, d, &newStatus):
         condition := NewDeploymentCondition(DeploymentProgressing,
             False, TimedOutReason, "ReplicaSet has timed out.")
     }
 
-    // API 서버에 status 업데이트
+    // update status in the API server
     dc.client.AppsV1().Deployments(ns).UpdateStatus(ctx, newDeployment, ...)
 }
 ```
 
-**완료 조건 (라인 741-746):**
+**Completion condition (lines 741-746):**
 ```go
 func DeploymentComplete(deployment, newStatus) bool {
-    return newStatus.UpdatedReplicas == *(deployment.Spec.Replicas) &&  // 모두 업데이트됨
-           newStatus.Replicas == *(deployment.Spec.Replicas) &&          // 총 수 일치
-           newStatus.AvailableReplicas == *(deployment.Spec.Replicas) && // 모두 available
-           newStatus.ObservedGeneration >= deployment.Generation          // generation 동기화됨
+    return newStatus.UpdatedReplicas == *(deployment.Spec.Replicas) &&  // all updated
+           newStatus.Replicas == *(deployment.Spec.Replicas) &&          // total count matches
+           newStatus.AvailableReplicas == *(deployment.Spec.Replicas) && // all available
+           newStatus.ObservedGeneration >= deployment.Generation          // generation in sync
 }
 ```
 
-**진행 조건 (라인 752-763):**
+**Progressing condition (lines 752-763):**
 ```go
 func DeploymentProgressing(deployment, newStatus) bool {
-    return newStatus.UpdatedReplicas > oldStatus.UpdatedReplicas ||  // 새 Pod 증가
-           oldReplicas > newReplicas ||                               // 기존 Pod 감소
-           newStatus.ReadyReplicas > deployment.Status.ReadyReplicas || // ready 증가
+    return newStatus.UpdatedReplicas > oldStatus.UpdatedReplicas ||  // new Pods increasing
+           oldReplicas > newReplicas ||                               // old Pods decreasing
+           newStatus.ReadyReplicas > deployment.Status.ReadyReplicas || // ready increasing
            newStatus.AvailableReplicas > deployment.Status.AvailableReplicas
 }
 ```
@@ -424,65 +493,79 @@ func DeploymentProgressing(deployment, newStatus) bool {
 
 ### Cleanup — RevisionHistoryLimit
 
-**파일:** [pkg/controller/deployment/sync.go](../pkg/controller/deployment/sync.go#L441)
+**File:** [pkg/controller/deployment/sync.go](../pkg/controller/deployment/sync.go#L441)
 
 ```go
-// 라인 441-476: cleanupDeployment()
-// RevisionHistoryLimit(기본 10) 초과한 오래된 RS 삭제
-// 조건: Pod 수 = 0인 RS만 삭제 가능
+// Lines 441-476: cleanupDeployment()
+// Delete old RSs exceeding RevisionHistoryLimit (default 10)
+// Condition: only RSs with Pod count = 0 can be deleted
 sort.Sort(deploymentutil.ReplicaSetsByRevision(cleanableRSes))
 for i := int32(0); i < diff; i++ {
     rs := cleanableRSes[i]
-    if rs.Status.Replicas != 0 { continue }  // Pod 있으면 건너뜀
+    if rs.Status.Replicas != 0 { continue }  // skip if it has Pods
     dc.client.AppsV1().ReplicaSets(rs.Namespace).Delete(ctx, rs.Name, ...)
 }
 ```
 
 ---
 
-## Expectations 패턴
+## The Expectations Pattern
 
-컨트롤러가 API 요청 후 실제 Watch 이벤트로 확인받을 때까지 중복 처리 방지:
+Prevents duplicate processing after the controller issues an API request, until confirmed by actual Watch events:
 
 ```
-1. ExpectCreations(key, 5) ← 5개 Pod 생성 요청 후 등록
-2. Pod Watch 이벤트 수신 → CreationObserved(key) 호출 (count--)
-3. SatisfiedExpectations(key) == true 가 될 때까지 재sync 하지 않음
+1. ExpectCreations(key, 5) ← registered after requesting creation of 5 Pods
+2. Pod Watch event received → CreationObserved(key) called (count--)
+3. No re-sync until SatisfiedExpectations(key) == true
 ```
 
 ---
 
 ## Deployment Status Conditions
 
-| Type | Reason | Status | 설명 |
+| Type | Reason | Status | Description |
 |------|--------|--------|------|
-| `Progressing` | `NewReplicaSetReason` | True | 새 RS 생성됨 |
-| `Progressing` | `ReplicaSetUpdatedReason` | True | RS 업데이트 중 |
-| `Progressing` | `NewRSAvailableReason` | True | 롤아웃 완료 |
-| `Progressing` | `TimedOutReason` | False | progressDeadlineSeconds 초과 |
-| `Available` | `MinimumReplicasAvailable` | True | 최소 replica 운영 중 |
-| `Available` | `MinimumReplicasUnavailable` | False | 최소 replica 부족 |
+| `Progressing` | `NewReplicaSetReason` | True | New RS created |
+| `Progressing` | `ReplicaSetUpdatedReason` | True | RS being updated |
+| `Progressing` | `NewRSAvailableReason` | True | Rollout complete |
+| `Progressing` | `TimedOutReason` | False | progressDeadlineSeconds exceeded |
+| `Available` | `MinimumReplicasAvailable` | True | Minimum replicas running |
+| `Available` | `MinimumReplicasUnavailable` | False | Below minimum replicas |
 
 ---
 
-## 핵심 파일 경로 요약
+## Key File Path Summary
 
-| 단계 | 파일 | 핵심 함수 | 라인 |
+| Step | File | Key Function | Line |
 |------|------|----------|------|
-| 컨트롤러 초기화 | [pkg/controller/deployment/deployment_controller.go](../pkg/controller/deployment/deployment_controller.go) | `NewDeploymentController` | 104 |
-| Sync 진입 | [pkg/controller/deployment/deployment_controller.go](../pkg/controller/deployment/deployment_controller.go) | `syncDeployment` | 574 |
-| 롤링 업데이트 | [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go) | `rolloutRolling` | 31 |
-| RS 생성 | [pkg/controller/deployment/sync.go](../pkg/controller/deployment/sync.go) | `getNewReplicaSet` | 146 |
-| Scale Up | [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go) | `reconcileNewReplicaSet` | 68 |
-| Scale Down | [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go) | `reconcileOldReplicaSets` | 86 |
-| RS Sync | [pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go) | `syncReplicaSet` | 755 |
-| Pod 조율 | [pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go) | `manageReplicas` | 649 |
-| 상태 업데이트 | [pkg/controller/deployment/progress.go](../pkg/controller/deployment/progress.go) | `syncRolloutStatus` | 36 |
-| 유틸 | [pkg/controller/deployment/util/deployment_util.go](../pkg/controller/deployment/util/deployment_util.go) | `NewRSNewReplicas`, `DeploymentComplete` | 817, 741 |
+| Controller init | [pkg/controller/deployment/deployment_controller.go](../pkg/controller/deployment/deployment_controller.go) | `NewDeploymentController` | 104 |
+| Sync entry | [pkg/controller/deployment/deployment_controller.go](../pkg/controller/deployment/deployment_controller.go) | `syncDeployment` | 574 |
+| Rolling update | [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go) | `rolloutRolling` | 31 |
+| RS creation | [pkg/controller/deployment/sync.go](../pkg/controller/deployment/sync.go) | `getNewReplicaSet` | 146 |
+| Scale up | [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go) | `reconcileNewReplicaSet` | 68 |
+| Scale down | [pkg/controller/deployment/rolling.go](../pkg/controller/deployment/rolling.go) | `reconcileOldReplicaSets` | 86 |
+| RS sync | [pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go) | `syncReplicaSet` | 755 |
+| Pod reconciliation | [pkg/controller/replicaset/replica_set.go](../pkg/controller/replicaset/replica_set.go) | `manageReplicas` | 649 |
+| Status update | [pkg/controller/deployment/progress.go](../pkg/controller/deployment/progress.go) | `syncRolloutStatus` | 36 |
+| Utilities | [pkg/controller/deployment/util/deployment_util.go](../pkg/controller/deployment/util/deployment_util.go) | `NewRSNewReplicas`, `DeploymentComplete` | 817, 741 |
 
 ---
 
-## 관련 시나리오
+## Related Concepts
 
-- [시나리오 1: API 요청 흐름](01-api-request-flow.md) — Deployment 객체가 저장되는 흐름
-- [시나리오 4: kubelet Pod 라이프사이클](04-kubelet-pod-lifecycle.md) — Pod가 실제 실행되는 흐름
+- **Controller pattern & level-triggered reconciliation.** A controller ignores the event payload and instead re-reads current state, then drives it toward `spec`. Missing an event is harmless because the next sync recomputes everything from scratch — "level-triggered, not edge-triggered."
+- **Owner references & cascading deletion.** A Deployment owns its ReplicaSets, which own their Pods, via `metadata.ownerReferences`. Deleting the Deployment lets the garbage collector cascade down; *adoption* lets a controller claim matching orphans that lack an owner.
+- **`pod-template-hash`.** Each ReplicaSet is named and labeled with a hash of its Pod template, so a changed template deterministically maps to a *new* ReplicaSet and old/new Pods never get mixed up.
+- **`maxSurge` / `maxUnavailable`.** The two rollout knobs: how many *extra* Pods may exist above the desired count, and how many may be *missing* below it. Together they bound the safety envelope the reconcile arithmetic enforces each sync.
+- **`generation` vs. `observedGeneration`.** `metadata.generation` increments on every spec change; the controller copies it into `status.observedGeneration` once it has processed that change — how tooling knows the controller has "seen" your latest edit.
+- **The Expectations pattern.** A short-lived in-memory cache of "I expect N creates / M deletes." It stops the controller from re-issuing the same create/delete while its earlier writes are still in flight through the informer (which would otherwise double-create).
+- **Revision history & rollback.** Each ReplicaSet is a frozen template revision; `kubectl rollout undo` simply scales an old ReplicaSet back up. `revisionHistoryLimit` caps how many are retained.
+
+> ⚠️ **A Deployment never touches Pods directly.** It only manages ReplicaSets; ReplicaSets manage Pods. Debugging a stuck rollout almost always means inspecting the ReplicaSets in between.
+
+---
+
+## Related Scenarios
+
+- [Scenario 1: API Request Flow](01-api-request-flow.md) — the flow in which the Deployment object is stored
+- [Scenario 4: kubelet Pod Lifecycle](04-kubelet-pod-lifecycle.md) — the flow in which Pods actually run

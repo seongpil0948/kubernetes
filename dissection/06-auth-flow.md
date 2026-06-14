@@ -1,83 +1,115 @@
-# 시나리오 6: 인증(Authentication) 및 인가(Authorization) 흐름
+# Scenario 6: Authentication and Authorization Flow
 
-API 서버로 HTTP 요청이 들어올 때 인증 → 인가 → Admission Webhook 순으로 처리되는 흐름을 추적합니다.
+Traces how an HTTP request arriving at the API server is processed in the order authentication → authorization → admission webhooks.
 
-## 전체 흐름도
+## Big Picture
+
+This path is a layered security gate. Authentication establishes identity, authorization evaluates permissions for that identity, and admission enforces object-level policy before storage handlers execute. Each layer receives richer context from the previous layer and can terminate the request independently.
+
+## Interface Resolution Guide (This Scenario)
+
+Security pipeline code crosses many interfaces (`authenticator.Request`, `authorizer`, `admission.Interface`). Use this order:
+1. Locate the interface method invoked in the filter.
+2. Find concrete implementers via assertions when available.
+3. Follow factory/registry assembly for chains where assertions are absent.
+4. Confirm runtime chain composition order because order changes behavior.
+
+### Worked Example: `authenticator.Request` -> `*unionAuthRequestHandler`
+
+The API server's request authenticator is a good example of a hidden concrete type:
+
+1. Interface: `type Request interface` in [../staging/src/k8s.io/apiserver/pkg/authentication/authenticator/interfaces.go](../staging/src/k8s.io/apiserver/pkg/authentication/authenticator/interfaces.go#L34).
+2. Concrete struct: `unionAuthRequestHandler` in [../staging/src/k8s.io/apiserver/pkg/authentication/request/union/union.go](../staging/src/k8s.io/apiserver/pkg/authentication/request/union/union.go#L27).
+3. Factory that hides the type: `union.New(...) authenticator.Request` in [../staging/src/k8s.io/apiserver/pkg/authentication/request/union/union.go](../staging/src/k8s.io/apiserver/pkg/authentication/request/union/union.go#L36) returns `&unionAuthRequestHandler{...}` in [../staging/src/k8s.io/apiserver/pkg/authentication/request/union/union.go](../staging/src/k8s.io/apiserver/pkg/authentication/request/union/union.go#L40).
+4. DI wiring: kube-apiserver appends concrete authenticators and wraps them with `union.New(authenticators...)` in [../pkg/kubeapiserver/authenticator/config.go](../pkg/kubeapiserver/authenticator/config.go#L211) and [../pkg/kubeapiserver/authenticator/config.go](../pkg/kubeapiserver/authenticator/config.go#L238).
+5. Runtime call site: `WithAuthentication()` invokes `auth.AuthenticateRequest(req)` in [../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go#L67), so the concrete union handler iterates the request authenticators it was wired with.
+
+This is why "follow the wiring" matters here: there is usually no `var _ authenticator.Request = &...{}` breadcrumb, but the constructor and chain assembly still show the real runtime object.
+
+## Reading Guide (Beginner)
+
+- **Trigger:** every API request traverses this chain before resource handlers run.
+- **Stage ownership:** authentication identifies caller, authorization checks permission, admission checks/mutates object.
+- **Error-code map:** authn failure -> 401, authz denial -> 403, admission/schema/policy rejection -> 4xx (often 422/400/403).
+- **Success criterion for this scenario:** request reaches the storage handler with an accepted identity, allowed action, and admissible object.
+- **Most common confusion:** valid credentials do not imply RBAC permission.
+
+## Overall Flow Diagram
 
 ```
-HTTP 요청 (kubectl / client-go)
+HTTP request (kubectl / client-go)
         │
-[1] TLS 핸드셰이크 (클라이언트 인증서 추출 가능)
+[1] TLS handshake (client certificate can be extracted)
         │
-[2] Handler 필터 체인
+[2] Handler filter chain
     staging/.../apiserver/pkg/server/config.go:DefaultBuildHandlerChain()
         │
-        ├─ WithRequestInfo() — URI에서 verb/resource/namespace 추출
+        ├─ WithRequestInfo() — extracts verb/resource/namespace from the URI
         │
-        ├─ [3] WithAuthentication() — 사용자 식별
+        ├─ [3] WithAuthentication() — identifies the user
         │       │
-        │       ├─ RequestHeader (X-Remote-User 헤더)
-        │       ├─ X.509 클라이언트 인증서
+        │       ├─ RequestHeader (X-Remote-User header)
+        │       ├─ X.509 client certificate
         │       ├─ Bearer Token
         │       │    ├─ TokenFile (static)
-        │       │    ├─ ServiceAccount JWT (RSA 서명 검증)
+        │       │    ├─ ServiceAccount JWT (RSA signature verification)
         │       │    ├─ BootstrapToken
-        │       │    ├─ OIDC JWT (외부 IdP)
-        │       │    └─ Webhook Token (외부 서비스)
-        │       └─ Anonymous (인증 실패 시 system:anonymous)
+        │       │    ├─ OIDC JWT (external IdP)
+        │       │    └─ Webhook Token (external service)
+        │       └─ Anonymous (system:anonymous on authentication failure)
         │
-        │ 실패 → 401 Unauthorized
-        │ 성공 → Context에 UserInfo 저장
+        │ Failure → 401 Unauthorized
+        │ Success → UserInfo stored in Context
         │
-        ├─ [4] WithAuthorization() — 권한 확인
+        ├─ [4] WithAuthorization() — permission check
         │       │
-        │       ├─ 속성 추출: verb, resource, namespace, name ...
+        │       ├─ Attribute extraction: verb, resource, namespace, name ...
         │       │
-        │       └─ RBAC 인가기
-        │           ├─ ClusterRoleBinding 순회
-        │           ├─ RoleBinding 순회 (namespace별)
-        │           └─ PolicyRule 매칭
+        │       └─ RBAC authorizer
+        │           ├─ Iterate ClusterRoleBindings
+        │           ├─ Iterate RoleBindings (per namespace)
+        │           └─ PolicyRule matching
         │
         │ Deny → 403 Forbidden
-        │ Allow → 다음 단계
+        │ Allow → next stage
         │
         └─ [5] Admission
                 │
-                ├─ Mutating Webhooks (객체 수정 가능)
-                ├─ Validating Webhooks (정책 검사)
-                └─ 내장 플러그인: ServiceAccount, LimitRanger, ResourceQuota, ...
+                ├─ Mutating Webhooks (may modify objects)
+                ├─ Validating Webhooks (policy checks)
+                └─ Built-in plugins: ServiceAccount, LimitRanger, ResourceQuota, ...
                 │
                 Reject → 400/403/422
-                Allow → 요청 핸들러 실행
+                Allow → request handler executes
 ```
 
 ---
 
-## 단계별 상세 분석
+## Detailed Step-by-Step Analysis
 
-### [2] 핸들러 필터 체인 구성
+### [2] Handler Filter Chain Construction
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/server/config.go](../staging/src/k8s.io/apiserver/pkg/server/config.go#L1036)
+**File:** [staging/src/k8s.io/apiserver/pkg/server/config.go](../staging/src/k8s.io/apiserver/pkg/server/config.go#L1036)
 
 ```go
-// 라인 1036-1116: DefaultBuildHandlerChain()
-// 체인 적용 순서 (안에서 밖으로 감싸기):
-handler = genericapifilters.WithAuthorization(handler, ...)      // 라인 1040
-handler = genericapifilters.WithImpersonation(handler, ...)      // 라인 1056
-handler = genericapifilters.WithAudit(handler, ...)              // 라인 1064
-handler = genericapifilters.WithAuthentication(handler, ...)     // 라인 1075
-handler = genericfilters.WithCORS(handler, ...)                  // 라인 1078
-handler = genericfilters.WithTimeoutForNonLongRunning(handler, ...) // 라인 1086
-handler = genericfilters.WithRequestDeadline(handler, ...)       // 라인 1088
-handler = genericfilters.WithWaitGroup(handler, ...)             // 라인 1090
-handler = genericapifilters.WithRequestInfo(handler, ...)        // 라인 1110
-handler = genericapifilters.WithPanicRecovery(handler, ...)      // 라인 1113
-handler = genericapifilters.WithAuditInit(handler, ...)          // 라인 1114
+// Lines 1036-1116: DefaultBuildHandlerChain()
+// Chain application order (wrapping from inside out):
+handler = genericapifilters.WithAuthorization(handler, ...)      // line 1040
+handler = genericapifilters.WithImpersonation(handler, ...)      // line 1056
+handler = genericapifilters.WithAudit(handler, ...)              // line 1064
+handler = genericapifilters.WithAuthentication(handler, ...)     // line 1075
+handler = genericfilters.WithCORS(handler, ...)                  // line 1078
+handler = genericfilters.WithTimeoutForNonLongRunning(handler, ...) // line 1086
+handler = genericfilters.WithRequestDeadline(handler, ...)       // line 1088
+handler = genericfilters.WithWaitGroup(handler, ...)             // line 1090
+handler = genericapifilters.WithRequestInfo(handler, ...)        // line 1110
+handler = genericapifilters.WithPanicRecovery(handler, ...)      // line 1113
+handler = genericapifilters.WithAuditInit(handler, ...)          // line 1114
 ```
 
-**WithRequestInfo()가 추출하는 정보:**
+**Information extracted by WithRequestInfo():**
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/endpoints/request/requestinfo.go](../staging/src/k8s.io/apiserver/pkg/endpoints/request/requestinfo.go)
+**File:** [staging/src/k8s.io/apiserver/pkg/endpoints/request/requestinfo.go](../staging/src/k8s.io/apiserver/pkg/endpoints/request/requestinfo.go)
 
 ```go
 type RequestInfo struct {
@@ -96,18 +128,18 @@ type RequestInfo struct {
 
 ---
 
-### [3] 인증 (Authentication)
+### [3] Authentication
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go#L46)
+**File:** [staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go#L46)
 
 ```go
-// 라인 46-125: WithAuthentication() / withAuthentication()
+// Lines 46-125: WithAuthentication() / withAuthentication()
 func withAuthentication(handler http.Handler, auth authenticator.Request, failed http.Handler, ...) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 
         authenticationStart := time.Now()
 
-        // 라인 67: 인증 체인 실행
+        // Line 67: run the authentication chain
         resp, ok, err := auth.AuthenticateRequest(req)
 
         if err != nil || !ok {
@@ -115,23 +147,23 @@ func withAuthentication(handler http.Handler, auth authenticator.Request, failed
             return
         }
 
-        // 라인 89: 인증 성공 후 Authorization 헤더 제거 (보안)
+        // Line 89: remove the Authorization header after successful authentication (security)
         req.Header.Del("Authorization")
 
-        // audience 검증 (OIDC 등)
+        // audience validation (OIDC etc.)
         if !audiencesAreAcceptable(apiAuds, resp.Audiences) {
             failed.ServeHTTP(w, req)
             return
         }
 
-        // 라인 122: Context에 사용자 정보 저장
+        // Line 122: store user info in Context
         req = req.WithContext(genericapirequest.WithUser(req.Context(), resp.User))
         handler.ServeHTTP(w, req)
     })
 }
 ```
 
-**UserInfo 인터페이스:**
+**UserInfo interface:**
 ```go
 type Info interface {
     GetName()   string    // e.g. "alice", "system:serviceaccount:default:myapp"
@@ -141,38 +173,40 @@ type Info interface {
 }
 ```
 
-#### [3a] 인증기 구성
+> ⚠️ **Concrete `user.Info` implementation in this path:** `user.DefaultInfo` ([authentication/user/user.go:46](../staging/src/k8s.io/apiserver/pkg/authentication/user/user.go#L46)). You can see it instantiated directly by concrete request authenticators, for example anonymous auth ([anonymous.go:43](../staging/src/k8s.io/apiserver/pkg/authentication/request/anonymous/anonymous.go#L43)) and x509 CN conversion ([x509.go:293](../staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go#L293)).
 
-**파일:** [pkg/kubeapiserver/authenticator/config.go](../pkg/kubeapiserver/authenticator/config.go#L107)
+#### [3a] Authenticator Configuration
+
+**File:** [pkg/kubeapiserver/authenticator/config.go](../pkg/kubeapiserver/authenticator/config.go#L107)
 
 ```go
-// 라인 107-249: Config.New() — 인증기 체인 구성
+// Lines 107-249: Config.New() — builds the authenticator chain
 func (config Config) New(ctx context.Context, ...) (authenticator.Request, ...) {
 
     var authenticators []authenticator.Request
 
-    // 1. Front Proxy (라인 115): X-Remote-User 헤더 (신뢰된 프록시에서)
+    // 1. Front Proxy (line 115): X-Remote-User header (from a trusted proxy)
     if config.RequestHeaderConfig != nil {
         authenticators = append(authenticators,
             headerrequest.NewDynamicVerifyOptionsSecure(...))
     }
 
-    // 2. X.509 클라이언트 인증서 (라인 128)
+    // 2. X.509 client certificate (line 128)
     if config.ClientCAContentProvider != nil {
         authenticators = append(authenticators,
             x509.NewDynamic(config.ClientCAContentProvider.VerifyOptions, x509.CommonNameUserConversion))
     }
 
-    // 3. Bearer Token들 (라인 134-201)
+    // 3. Bearer Tokens (lines 134-201)
     var tokenAuthenticators []authenticator.Token
 
-    // 3a. 정적 토큰 파일
+    // 3a. Static token file
     if len(config.TokenAuthFile) != 0 {
         tokenAuthenticators = append(tokenAuthenticators,
             tokenfile.NewCSV(...))
     }
 
-    // 3b. ServiceAccount 토큰 (라인 153)
+    // 3b. ServiceAccount token (line 153)
     if config.ServiceAccountConfig.Lookup {
         tokenAuthenticators = append(tokenAuthenticators,
             serviceaccount.NewValidator(
@@ -180,76 +214,85 @@ func (config Config) New(ctx context.Context, ...) (authenticator.Request, ...) 
                 serviceaccount.ExtendedTokenValidator(...)))
     }
 
-    // 3c. OIDC JWT (라인 167)
+    // 3c. OIDC JWT (line 167)
     if len(config.OIDCConfig.IssuerURL) != 0 {
         oidcAuth, err := oidc.New(ctx, config.OIDCConfig)
         tokenAuthenticators = append(tokenAuthenticators, oidcAuth)
     }
 
-    // 3d. Webhook Token (라인 195)
+    // 3d. Webhook Token (line 195)
     if config.WebhookTokenAuthnConfigFile != "" {
         webhookTokenAuth, _ := webhook.New(config.WebhookTokenAuthnConfigFile, ...)
         tokenAuthenticators = append(tokenAuthenticators, webhookTokenAuth)
     }
 
-    // Token 인증기들을 union으로 묶음
+    // Combine the token authenticators into a union
     tokenAuth := tokenunion.New(tokenAuthenticators...)
 
-    // Token 결과 캐싱 (라인 208)
+    // Token result caching (line 208)
     if config.TokenSuccessCacheTTL > 0 || config.TokenFailureCacheTTL > 0 {
         tokenAuth = tokencache.New(tokenAuth, true,
             config.TokenSuccessCacheTTL, config.TokenFailureCacheTTL)
     }
 
-    // Bearer Token 인증기 추가
+    // Add the Bearer Token authenticator
     authenticators = append(authenticators,
         bearertoken.New(tokenAuth))
 
-    // 4. Anonymous 인증기 (라인 242): 마지막 fallback
+    // 4. Anonymous authenticator (line 242): final fallback
     if config.Anonymous.Enabled {
         authenticators = append(authenticators,
             anonymous.NewAuthenticator(config.Anonymous.Conditions))
     }
 
-    // 전체 chain 반환
+    // Return the full chain
     return union.New(authenticators...), ...
 }
 ```
 
-#### [3b] ServiceAccount JWT 검증 흐름
+> ⚠️ **What does `union.New(...)` return?** Do a full interface trace:
+> 1. Interface: `authenticator.Request` ([authenticator/interfaces.go:34](../staging/src/k8s.io/apiserver/pkg/authentication/authenticator/interfaces.go#L34)).
+> 2. Concrete struct: `unionAuthRequestHandler` ([request/union/union.go:27](../staging/src/k8s.io/apiserver/pkg/authentication/request/union/union.go#L27)).
+> 3. Factory that hides the type: `New(... ) authenticator.Request` ([union.go:36](../staging/src/k8s.io/apiserver/pkg/authentication/request/union/union.go#L36)) returns `&unionAuthRequestHandler{...}` ([union.go:40](../staging/src/k8s.io/apiserver/pkg/authentication/request/union/union.go#L40)).
+> 4. DI wiring: kube-apiserver appends concrete request authenticators (`x509.NewDynamic`, `bearertoken.New`, `anonymous.NewAuthenticator`) in `Config.New` ([pkg/kubeapiserver/authenticator/config.go:128](../pkg/kubeapiserver/authenticator/config.go#L128), [config.go:211](../pkg/kubeapiserver/authenticator/config.go#L211), [config.go:233](../pkg/kubeapiserver/authenticator/config.go#L233)), then wraps them with `union.New(authenticators...)` ([config.go:238](../pkg/kubeapiserver/authenticator/config.go#L238)).
+> 5. Concrete examples under that interface boundary: `x509.Authenticator` ([x509.go:120](../staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go#L120)), `bearertoken.Authenticator` ([bearertoken.go:32](../staging/src/k8s.io/apiserver/pkg/authentication/request/bearertoken/bearertoken.go#L32)), and `anonymous.Authenticator` ([anonymous.go:32](../staging/src/k8s.io/apiserver/pkg/authentication/request/anonymous/anonymous.go#L32)).
+>
+> In this auth path, there is usually no `var _ authenticator.Request = &...{}` assertion, so constructor return types + runtime wiring are the reliable way to find implementers.
+
+#### [3b] ServiceAccount JWT Verification Flow
 
 ```
-요청 헤더: Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+Request header: Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
     │
     ▼
 bearertoken.AuthenticateRequest()
-    │ 헤더에서 토큰 추출
+    │ extracts the token from the header
     ▼
 serviceaccount.Validator.AuthenticateToken()
     │
-    ├─ JWT 파싱 (header.payload.signature)
-    ├─ 서명 검증 (API 서버의 공개키로)
-    ├─ 만료 시간 확인
-    ├─ API 서버에 ServiceAccount 실존 확인 (Lookup=true 시)
-    └─ UserInfo 반환:
+    ├─ Parse JWT (header.payload.signature)
+    ├─ Verify signature (with the API server's public key)
+    ├─ Check expiration time
+    ├─ Confirm the ServiceAccount exists in the API server (when Lookup=true)
+    └─ Return UserInfo:
        Name:   "system:serviceaccount:default:myapp"
        Groups: ["system:serviceaccounts", "system:serviceaccounts:default"]
 ```
 
-#### [3c] X.509 인증서 검증 흐름
+#### [3c] X.509 Certificate Verification Flow
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go](../staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go#L138)
+**File:** [staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go](../staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go#L138)
 
 ```go
-// 라인 138-150: AuthenticateRequest()
+// Lines 138-150: AuthenticateRequest()
 func (a *Authenticator) AuthenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
 
-    // TLS 없거나 인증서 없으면 통과
+    // Pass through if there is no TLS or no certificate
     if req.TLS == nil || len(req.TLS.PeerCertificates) == 0 {
         return nil, false, nil
     }
 
-    // 인증서 검증 (CA 체인)
+    // Verify the certificate (CA chain)
     optsCopy, ok := a.verifyOptionsFn()
     chains, err := req.TLS.PeerCertificates[0].Verify(optsCopy)
 
@@ -261,40 +304,40 @@ func (a *Authenticator) AuthenticateRequest(req *http.Request) (*authenticator.R
 
 ---
 
-### [4] 인가 (Authorization)
+### [4] Authorization
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go#L55)
+**File:** [staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go#L55)
 
 ```go
-// 라인 55-97: withAuthorization()
+// Lines 55-97: withAuthorization()
 func withAuthorization(handler http.Handler, a authorizer.UnconditionalAuthorizer, ...) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 
-        // 라인 64: 요청 속성 추출
+        // Line 64: extract request attributes
         attributes, err := GetAuthorizerAttributes(ctx)
 
-        // 라인 69: 인가 결정
+        // Line 69: authorization decision
         authorized, reason, err := a.Authorize(ctx, attributes)
 
-        // 라인 79: Allow
+        // Line 79: Allow
         if authorized == authorizer.DecisionAllow {
             audit.AddAuditAnnotations(ctx, "authorization.k8s.io/decision", "allow", ...)
             handler.ServeHTTP(w, req)
             return
         }
 
-        // 라인 91: Forbidden
+        // Line 91: Forbidden
         audit.AddAuditAnnotations(ctx, "authorization.k8s.io/decision", "forbid", ...)
         responsewriters.Forbidden(attributes, w, req, reason, s)
     })
 }
 ```
 
-**속성 추출 (라인 99-149):**
+**Attribute extraction (lines 99-149):**
 ```go
 func GetAuthorizerAttributes(ctx context.Context) (authorizer.Attributes, error) {
     attribs := authorizer.AttributesRecord{
-        User:              user,           // 인증된 사용자
+        User:              user,           // authenticated user
         Verb:              requestInfo.Verb,         // get/list/create/...
         Resource:          requestInfo.Resource,     // pods/services/...
         Subresource:       requestInfo.Subresource,  // status/log/...
@@ -308,15 +351,15 @@ func GetAuthorizerAttributes(ctx context.Context) (authorizer.Attributes, error)
 }
 ```
 
-#### [4a] RBAC 인가기
+#### [4a] RBAC Authorizer
 
-**파일:** [plugin/pkg/auth/authorizer/rbac/rbac.go](../plugin/pkg/auth/authorizer/rbac/rbac.go#L78)
+**File:** [plugin/pkg/auth/authorizer/rbac/rbac.go](../plugin/pkg/auth/authorizer/rbac/rbac.go#L78)
 
 ```go
-// 라인 78-130: Authorize()
+// Lines 78-130: Authorize()
 func (r *RBACAuthorizer) Authorize(ctx context.Context, requestAttributes authorizer.Attributes) (authorizer.Decision, string, error) {
 
-    // 라인 79: 규칙 방문자 패턴
+    // Line 79: rule visitor pattern
     ruleCheckingVisitor := &authorizingVisitor{requestAttributes: requestAttributes}
 
     r.authorizationRuleResolver.VisitRulesFor(ctx,
@@ -324,50 +367,50 @@ func (r *RBACAuthorizer) Authorize(ctx context.Context, requestAttributes author
         requestAttributes.GetNamespace(),
         ruleCheckingVisitor.visit)
 
-    // 라인 82: 매칭 성공
+    // Line 82: match succeeded
     if ruleCheckingVisitor.allowed {
         return authorizer.DecisionAllow, ruleCheckingVisitor.reason, nil
     }
 
-    // 라인 100+: 실패 사유 구성
+    // Lines 100+: construct the failure reason
     // "user \"alice\" cannot create pods in namespace \"default\""
     return authorizer.DecisionNoOpinion, reason, nil
 }
 ```
 
-**규칙 방문 (pkg/registry/rbac/validation/rule.go):**
+**Rule visiting (pkg/registry/rbac/validation/rule.go):**
 
 ```go
-// VisitRulesFor() 동작:
-1. ClusterRoleBinding 목록 순회
-   └─ user/group이 Subject에 포함되면
-      → ClusterRole의 rules 추출
-      → visit(nil, rule) 호출
+// VisitRulesFor() behavior:
+1. Iterate over the ClusterRoleBinding list
+   └─ If the user/group is included in a Subject
+      → extract the ClusterRole's rules
+      → call visit(nil, rule)
 
-2. namespace가 있으면 RoleBinding 목록 순회
-   └─ user/group이 Subject에 포함되면
-      → Role/ClusterRole의 rules 추출
-      → visit(namespace, rule) 호출
+2. If a namespace is present, iterate over the RoleBinding list
+   └─ If the user/group is included in a Subject
+      → extract the Role/ClusterRole's rules
+      → call visit(namespace, rule)
 ```
 
-**규칙 매칭 (라인 181-196):**
+**Rule matching (lines 181-196):**
 ```go
-// RuleAllows() — 요청이 규칙에 매칭되는지 확인
+// RuleAllows() — checks whether the request matches the rule
 func RuleAllows(requestAttributes authorizer.Attributes, rule *rbacv1.PolicyRule) bool {
     if requestAttributes.IsResourceRequest() {
         combinedResource := resource + "/" + subresource  // e.g. "pods/log"
         return VerbMatches(rule, verb) &&        // "get" in ["get","list"]
             APIGroupMatches(rule, apiGroup) &&   // "" in [""]
             ResourceMatches(rule, resource, subresource) &&  // "pods" in ["pods","services"]
-            ResourceNameMatches(rule, name)      // "" (전체) or "my-pod"
+            ResourceNameMatches(rule, name)      // "" (all) or "my-pod"
     }
-    // Non-resource URL 요청
+    // Non-resource URL request
     return VerbMatches(rule, verb) &&
         NonResourceURLMatches(rule, path)
 }
 ```
 
-**RBAC 예시:**
+**RBAC example:**
 
 ```yaml
 # ClusterRole
@@ -376,36 +419,36 @@ rules:
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
 
-# 요청: GET /api/v1/namespaces/default/pods/my-pod
+# Request: GET /api/v1/namespaces/default/pods/my-pod
 # Verb: get, Resource: pods, APIGroup: "", Namespace: default, Name: my-pod
 # → VerbMatches("get", ["get","list","watch"]) = true
 # → APIGroupMatches("", [""]) = true
 # → ResourceMatches("pods", ["pods"]) = true
-# → ResourceNameMatches("my-pod", []) = true (빈 배열 = 모두 허용)
+# → ResourceNameMatches("my-pod", []) = true (empty array = allow all)
 # → ALLOW
 ```
 
 ---
 
-### [5] Admission 제어
+### [5] Admission Control
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/admission/chain.go](../staging/src/k8s.io/apiserver/pkg/admission/chain.go#L31)
+**File:** [staging/src/k8s.io/apiserver/pkg/admission/chain.go](../staging/src/k8s.io/apiserver/pkg/admission/chain.go#L31)
 
 ```go
-// 라인 31-44: Admit() — Mutating
+// Lines 31-44: Admit() — Mutating
 func (admissionHandler chainAdmissionHandler) Admit(ctx, a Attributes, o ObjectInterfaces) error {
     for _, handler := range admissionHandler {
         if !handler.Handles(a.GetOperation()) { continue }
         if mutator, ok := handler.(MutationInterface); ok {
             if err := mutator.Admit(ctx, a, o); err != nil {
-                return err  // 하나라도 실패 → 요청 거부
+                return err  // any failure → request rejected
             }
         }
     }
     return nil
 }
 
-// 라인 47-60: Validate() — Validating
+// Lines 47-60: Validate() — Validating
 func (admissionHandler chainAdmissionHandler) Validate(ctx, a Attributes, o ObjectInterfaces) error {
     for _, handler := range admissionHandler {
         if !handler.Handles(a.GetOperation()) { continue }
@@ -419,29 +462,117 @@ func (admissionHandler chainAdmissionHandler) Validate(ctx, a Attributes, o Obje
 }
 ```
 
-**Admission 실행 순서:**
+> ⚠️ **`handler` is `admission.Interface`; find concrete plugin structs through registry wiring.**
+> 1. Interface boundary: `type Interface interface` ([interfaces.go:123](../staging/src/k8s.io/apiserver/pkg/admission/interfaces.go#L123)).
+> 2. Runtime checks in the loop: `handler.(MutationInterface)` and `handler.(ValidationInterface)` in [chain.go:35](../staging/src/k8s.io/apiserver/pkg/admission/chain.go#L35) and [chain.go:51](../staging/src/k8s.io/apiserver/pkg/admission/chain.go#L51).
+> 3. Construction path: `NewFromPlugins(...)` builds `handlers []Interface` and classifies each plugin by those interfaces ([plugins.go:127](../staging/src/k8s.io/apiserver/pkg/admission/plugins.go#L127), [plugins.go:148](../staging/src/k8s.io/apiserver/pkg/admission/plugins.go#L148), [plugins.go:151](../staging/src/k8s.io/apiserver/pkg/admission/plugins.go#L151)).
+> 4. Factory hop: each plugin `Register` callback returns `admission.Interface` from its concrete constructor, for example mutating webhook ([mutating/plugin.go:36](../staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/plugin.go#L36), [mutating/plugin.go:71](../staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/plugin.go#L71)) and validating webhook ([validating/plugin.go:36](../staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/validating/plugin.go#L36), [validating/plugin.go:71](../staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/validating/plugin.go#L71)).
+> 5. Compile-time proof where present: `var _ admission.MutationInterface = &Plugin{}` and `var _ admission.ValidationInterface = &Plugin{}` ([mutating/plugin.go:52](../staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/plugin.go#L52), [validating/plugin.go:52](../staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/validating/plugin.go#L52)).
+> 6. Final wiring into the generic loop: `newReinvocationHandler(chainAdmissionHandler(handlers))` ([plugins.go:162](../staging/src/k8s.io/apiserver/pkg/admission/plugins.go#L162)).
+
+**Admission execution order:**
 ```
-1. Mutating Admission Webhooks (병렬 → 직렬 처리)
-   └─ 객체 수정 가능 (defaulting, injection 등)
-   └─ 예: Istio sidecar 주입, ServiceAccount 볼륨 마운트 추가
+1. Mutating Admission Webhooks (parallel → serial processing)
+   └─ May modify objects (defaulting, injection, etc.)
+   └─ Examples: Istio sidecar injection, adding ServiceAccount volume mounts
 
-2. Schema Validation (수정된 객체 재검증)
+2. Schema Validation (re-validates the modified object)
 
-3. Validating Admission Webhooks (병렬 처리)
-   └─ 수정 불가, 허용/거부만
-   └─ 예: OPA Gatekeeper, Kyverno
+3. Validating Admission Webhooks (parallel processing)
+   └─ Cannot modify; allow/deny only
+   └─ Examples: OPA Gatekeeper, Kyverno
 
-4. 내장 플러그인:
-   - ServiceAccount: SA 토큰 시크릿 마운트
-   - LimitRanger: 기본 resource request/limit 설정
-   - ResourceQuota: 네임스페이스 쿼터 확인
-   - PodSecurity: PSS 정책 확인
-   - NamespaceLifecycle: 삭제 중인 네임스페이스에 새 리소스 방지
+4. Built-in plugins:
+   - ServiceAccount: mounts SA token secrets
+   - LimitRanger: sets default resource requests/limits
+   - ResourceQuota: checks namespace quota
+   - PodSecurity: checks PSS policies
+   - NamespaceLifecycle: prevents new resources in a namespace being deleted
 ```
 
-**Admission 속성:**
+#### [5a] Mutating Webhook Dispatcher — Inside the Webhook Loop
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/admission/interfaces.go](../staging/src/k8s.io/apiserver/pkg/admission/interfaces.go#L29)
+**File:** [staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/dispatcher.go](../staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/dispatcher.go#L108)
+
+```go
+// Lines 108-250+: Dispatch()
+func (a *mutatingDispatcher) Dispatch(ctx, attr, o, hooks []webhook.WebhookAccessor) error {
+    // Reinvocation context — tracks which webhooks have already run
+    webhookReinvokeCtx := /* load or create */
+
+    // If any in-tree plugin has mutated the object since the last webhook round,
+    // mark all eligible webhooks for re-invocation.
+    if reinvokeCtx.IsReinvoke() &&
+        webhookReinvokeCtx.IsOutputChangedSinceLastWebhookInvocation(attr.GetObject()) {
+        webhookReinvokeCtx.RequireReinvokingPreviouslyInvokedPlugins()
+    }
+
+    for i, hook := range hooks {
+        // Skip if the webhook's rules/namespaceSelector don't match (line 130)
+        invocation, _ := a.plugin.ShouldCallHook(ctx, hook, attr, o, v)
+        if invocation == nil { continue }
+
+        // Skip reinvocations for webhooks that did not opt in (line 143)
+        if reinvokeCtx.IsReinvoke() &&
+            !webhookReinvokeCtx.ShouldReinvokeWebhook(invocation.Webhook.GetUID()) {
+            continue
+        }
+
+        // Convert object to the version the webhook expects (line 152)
+        versionedAttr, _ := v.VersionedAttribute(invocation.Kind)
+
+        // Make the HTTPS POST call to the webhook endpoint (line 163)
+        changed, err := a.callAttrMutatingHook(ctx, hook, invocation, versionedAttr, ...)
+
+        // Error handling depends on failurePolicy (lines 164-220)
+        if err != nil {
+            if *hook.FailurePolicy == admissionregistrationv1.Ignore {
+                // fail-open: log the error but continue
+                klog.Warningf("Failed calling webhook, failing open %v: %v", hook.Name, err)
+                continue
+            }
+            // fail-closed (default): reject the request
+            return apierrors.NewInternalError(err)
+        }
+
+        // If the webhook mutated the object, trigger reinvocation of all
+        // prior webhooks that have ReinvocationPolicy=IfNeeded (line 224)
+        if changed {
+            webhookReinvokeCtx.RequireReinvokingPreviouslyInvokedPlugins()
+            reinvokeCtx.SetShouldReinvoke()
+        }
+        if *hook.ReinvocationPolicy == admissionregistrationv1.IfNeededReinvocationPolicy {
+            webhookReinvokeCtx.AddReinvocableWebhookToPreviouslyInvoked(uid)
+        }
+    }
+    return nil
+}
+```
+
+**Reinvocation model:**
+```
+Round 0: webhooks A → B → C  (A mutates object)
+              └─ B sees A's mutation
+              └─ C sees A+B mutations
+              └─ C mutates object → SetShouldReinvoke()
+
+Round 1 (reinvoke): webhooks A → B  (only IfNeeded ones, not C since C triggered it)
+              └─ A re-runs because object changed
+              └─ B re-runs because object changed
+```
+
+> ⚠️ **Reinvocation is bounded.** The framework limits rounds to prevent infinite loops. If the object is still mutating after the allowed reinvocation passes, the admission chain aborts with an error.
+
+**`failurePolicy` semantics:**
+
+| Value | Webhook unreachable or returns 5xx | Webhook returns 4xx/reject |
+|-------|-----------------------------------|--------------------------|
+| `Fail` (default) | Request rejected (fail-closed) | Request rejected |
+| `Ignore` | Request continues (fail-open) | Request rejected |
+
+**Admission attributes:**
+
+**File:** [staging/src/k8s.io/apiserver/pkg/admission/interfaces.go](../staging/src/k8s.io/apiserver/pkg/admission/interfaces.go#L29)
 
 ```go
 type Attributes interface {
@@ -450,8 +581,8 @@ type Attributes interface {
     GetResource() schema.GroupVersionResource
     GetSubresource() string
     GetOperation() Operation           // CREATE, UPDATE, DELETE, CONNECT
-    GetObject() runtime.Object        // 요청 객체 (수정 가능 - Mutating)
-    GetOldObject() runtime.Object     // 기존 객체 (UPDATE/DELETE)
+    GetObject() runtime.Object        // request object (modifiable - Mutating)
+    GetOldObject() runtime.Object     // existing object (UPDATE/DELETE)
     GetUserInfo() user.Info
     IsDryRun() bool
     GetKind() schema.GroupVersionKind
@@ -460,40 +591,40 @@ type Attributes interface {
 
 ---
 
-### Impersonation (위장)
+### Impersonation
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/server/config.go](../staging/src/k8s.io/apiserver/pkg/server/config.go#L1056)
+**File:** [staging/src/k8s.io/apiserver/pkg/server/config.go](../staging/src/k8s.io/apiserver/pkg/server/config.go#L1056)
 
 ```go
-// 라인 1056-1060: WithImpersonation()
-// 헤더 Impersonate-User, Impersonate-Group 처리
-// 인가 조건: 요청자가 impersonation RBAC 권한 보유 시 다른 사용자로 작업
+// Lines 1056-1060: WithImpersonation()
+// Handles the Impersonate-User and Impersonate-Group headers
+// Authorization condition: the requester can act as another user if they hold impersonation RBAC permissions
 ```
 
 ```bash
-# 예시: admin이 alice로 가장하여 요청
+# Example: admin impersonates alice for a request
 kubectl get pods --as=alice --as-group=developers
-# → 헤더: Impersonate-User: alice, Impersonate-Group: developers
+# → Headers: Impersonate-User: alice, Impersonate-Group: developers
 ```
 
 ---
 
-## 에러 처리 요약
+## Error Handling Summary
 
-| 단계 | 에러 | HTTP 코드 |
+| Stage | Error | HTTP Code |
 |------|------|---------|
-| 인증 실패 (토큰 없음) | - | 401 Unauthorized |
-| 인증 실패 (잘못된 토큰) | - | 401 Unauthorized |
-| 인가 실패 | "user X cannot Y Z" | 403 Forbidden |
-| Admission Validation 실패 | "field X: value Y is invalid" | 422 Unprocessable Entity |
-| Admission Policy 거부 | Webhook 응답 메시지 | 403 Forbidden |
-| Admission 내부 오류 | - | 500 Internal Server Error |
+| Authentication failure (no token) | - | 401 Unauthorized |
+| Authentication failure (invalid token) | - | 401 Unauthorized |
+| Authorization failure | "user X cannot Y Z" | 403 Forbidden |
+| Admission validation failure | "field X: value Y is invalid" | 422 Unprocessable Entity |
+| Admission policy denial | Webhook response message | 403 Forbidden |
+| Admission internal error | - | 500 Internal Server Error |
 
 ---
 
-## 감사(Audit) 로그
+## Audit Log
 
-인증/인가 결과는 Audit Log에 자동 기록됩니다:
+Authentication/authorization results are automatically recorded in the Audit Log:
 
 ```json
 {
@@ -513,25 +644,39 @@ kubectl get pods --as=alice --as-group=developers
 
 ---
 
-## 핵심 파일 경로 요약
+## Key File Path Summary
 
-| 단계 | 파일 | 핵심 함수 | 라인 |
+| Stage | File | Key Function | Line |
 |------|------|----------|------|
-| 필터 체인 | [staging/.../server/config.go](../staging/src/k8s.io/apiserver/pkg/server/config.go) | `DefaultBuildHandlerChain` | 1036 |
-| 인증 필터 | [staging/.../filters/authentication.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go) | `WithAuthentication` | 46 |
-| 인증기 구성 | [pkg/kubeapiserver/authenticator/config.go](../pkg/kubeapiserver/authenticator/config.go) | `Config.New` | 107 |
-| X.509 인증 | [staging/.../authentication/request/x509/x509.go](../staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go) | `AuthenticateRequest` | 138 |
-| Bearer 토큰 | [staging/.../authentication/request/bearertoken/bearertoken.go](../staging/src/k8s.io/apiserver/pkg/authentication/request/bearertoken/bearertoken.go) | `AuthenticateRequest` | 42 |
-| 인가 필터 | [staging/.../filters/authorization.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go) | `WithAuthorization` | 51 |
-| 속성 추출 | [staging/.../filters/authorization.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go) | `GetAuthorizerAttributes` | 99 |
-| RBAC 인가 | [plugin/pkg/auth/authorizer/rbac/rbac.go](../plugin/pkg/auth/authorizer/rbac/rbac.go) | `Authorize` | 78 |
-| 규칙 매칭 | [plugin/pkg/auth/authorizer/rbac/rbac.go](../plugin/pkg/auth/authorizer/rbac/rbac.go) | `RuleAllows` | 181 |
-| 규칙 방문 | [pkg/registry/rbac/validation/rule.go](../pkg/registry/rbac/validation/rule.go) | `VisitRulesFor` | 179 |
-| Admission 체인 | [staging/.../admission/chain.go](../staging/src/k8s.io/apiserver/pkg/admission/chain.go) | `Admit`, `Validate` | 31, 47 |
+| Filter chain | [staging/.../server/config.go](../staging/src/k8s.io/apiserver/pkg/server/config.go) | `DefaultBuildHandlerChain` | 1036 |
+| Authentication filter | [staging/.../filters/authentication.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go) | `WithAuthentication` | 46 |
+| Authenticator configuration | [pkg/kubeapiserver/authenticator/config.go](../pkg/kubeapiserver/authenticator/config.go) | `Config.New` | 107 |
+| X.509 authentication | [staging/.../authentication/request/x509/x509.go](../staging/src/k8s.io/apiserver/pkg/authentication/request/x509/x509.go) | `AuthenticateRequest` | 138 |
+| Bearer token | [staging/.../authentication/request/bearertoken/bearertoken.go](../staging/src/k8s.io/apiserver/pkg/authentication/request/bearertoken/bearertoken.go) | `AuthenticateRequest` | 42 |
+| Authorization filter | [staging/.../filters/authorization.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go) | `WithAuthorization` | 51 |
+| Attribute extraction | [staging/.../filters/authorization.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go) | `GetAuthorizerAttributes` | 99 |
+| RBAC authorization | [plugin/pkg/auth/authorizer/rbac/rbac.go](../plugin/pkg/auth/authorizer/rbac/rbac.go) | `Authorize` | 78 |
+| Rule matching | [plugin/pkg/auth/authorizer/rbac/rbac.go](../plugin/pkg/auth/authorizer/rbac/rbac.go) | `RuleAllows` | 181 |
+| Rule visiting | [pkg/registry/rbac/validation/rule.go](../pkg/registry/rbac/validation/rule.go) | `VisitRulesFor` | 179 |
+| Admission chain | [staging/.../admission/chain.go](../staging/src/k8s.io/apiserver/pkg/admission/chain.go) | `Admit`, `Validate` | 31, 47 |
 
 ---
 
-## 관련 시나리오
+## Related Concepts
 
-- [시나리오 1: API 요청 흐름](01-api-request-flow.md) — 인증/인가 이후의 처리 흐름
-- [시나리오 3: Deployment 롤링 업데이트](03-deployment-rolling-update.md) — 컨트롤러가 API 호출 시 인증되는 방식 (ServiceAccount)
+- **Three distinct gates: AuthN → AuthZ → Admission.** Authentication asks "*who are you?*" (→ 401), authorization asks "*are you allowed this verb on this resource?*" (→ 403), and admission asks "*is this specific object acceptable, and should it be mutated?*" (→ 4xx). Different questions, different failure codes.
+- **Authenticator union.** The server tries each method in order (client cert, bearer token, …) until one succeeds; any single success authenticates the request. That ordered "first to succeed wins" chain is the `union` authenticator.
+- **The RBAC model.** Roles/ClusterRoles hold *rules* (verbs × resources); RoleBindings/ClusterRoleBindings attach those rules to *subjects* (users, groups, ServiceAccounts). RBAC is **additive and deny-by-default** — there are no deny rules, only the absence of an allow.
+- **ServiceAccount tokens.** Pods receive projected, **audience-bound, expiring** JWTs; the API server verifies the signature with its keys and can confirm the SA still exists. This is how in-cluster controllers authenticate (ties back to Scenario 3).
+- **Mutating vs. validating admission.** Mutating plugins/webhooks may *change* the object (defaulting, sidecar injection); validating ones may only *accept or reject*. Order is fixed: mutate → re-validate schema → validate, so a later validator always sees the mutated object.
+- **Impersonation.** With the right RBAC, a caller can act as another user/group via `Impersonate-*` headers (`kubectl --as`) — useful for delegated access and `kubectl auth can-i --as` debugging.
+- **Audit.** Every authn/authz decision is annotated and written to the audit log — the authoritative "who did what, and was it allowed" trail.
+
+> ⚠️ **Authentication never decides permissions.** A perfectly valid token still gets a 403 if no RBAC rule allows the verb. "Logged in" and "allowed" are separate stages — don't debug an authz 403 by re-checking the token.
+
+---
+
+## Related Scenarios
+
+- [Scenario 1: API Request Flow](01-api-request-flow.md) — processing flow after authentication/authorization
+- [Scenario 3: Deployment Rolling Update](03-deployment-rolling-update.md) — how controllers authenticate when calling the API (ServiceAccount)

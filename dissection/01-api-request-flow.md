@@ -1,8 +1,40 @@
-# 시나리오 1: API 요청 흐름 (kubectl → kube-apiserver → etcd)
+# Scenario 1: API Request Flow (kubectl → kube-apiserver → etcd)
 
-`kubectl create -f pod.yaml` 실행부터 etcd 저장까지의 전체 경로를 추적합니다.
+Traces the full path from running `kubectl create -f pod.yaml` to persistence in etcd.
 
-## 전체 흐름도
+## Big Picture
+
+This flow is a layered pipeline: `kubectl` builds and sends an HTTP request, kube-apiserver applies cross-cutting filters (authn/authz/admission), then a resource-specific REST storage implementation persists the object through the generic registry into etcd. If you keep this three-stage model in mind (client -> server filters -> storage), every call hop in the trace becomes easier to place.
+
+## Interface Resolution Guide (This Scenario)
+
+When you hit an interface boundary in this document, use this order:
+1. Find the interface type definition.
+2. Look for `var _ Interface = &Struct{}` compile-time assertions.
+3. If no assertion exists, follow constructor return types and assignment wiring.
+4. Confirm runtime selection points (maps, registries, or switch branches) that choose the concrete value.
+
+### Worked Example: `rest.Creater` for `pods`
+
+One real trace in this scenario is the POST `/api/v1/namespaces/default/pods` storage path:
+
+1. Interface: `type Creater interface` in [../staging/src/k8s.io/apiserver/pkg/registry/rest/rest.go](../staging/src/k8s.io/apiserver/pkg/registry/rest/rest.go#L202).
+2. Concrete behavior: pod storage's `REST` struct embeds `*genericregistry.Store` in [../pkg/registry/core/pod/storage/storage.go](../pkg/registry/core/pod/storage/storage.go#L70), and `Store` provides `New()` and `Create()` in [../staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go](../staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go#L371) and [../staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go](../staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go#L514).
+3. Factory wiring: `podstore.NewStorage(...)` builds the store and returns `PodStorage{Pod: &REST{store, ...}}` in [../pkg/registry/core/pod/storage/storage.go](../pkg/registry/core/pod/storage/storage.go#L76).
+4. Registration wiring: core API installation puts that exact value into `storage["pods"] = podStorage.Pod` in [../pkg/registry/core/rest/storage_core.go](../pkg/registry/core/rest/storage_core.go#L240).
+5. Runtime selection: the endpoint installer type-asserts `storage.(rest.Creater)` in [../staging/src/k8s.io/apiserver/pkg/endpoints/installer.go](../staging/src/k8s.io/apiserver/pkg/endpoints/installer.go#L337), and for POST uses `restfulCreateResource(creater, ...)` in [../staging/src/k8s.io/apiserver/pkg/endpoints/installer.go](../staging/src/k8s.io/apiserver/pkg/endpoints/installer.go#L925).
+
+This path has no single `var _ rest.Creater = ...` breadcrumb. The reliable proof is the combination of embedded methods, storage-map registration, and the installer's runtime type assertion.
+
+## Reading Guide (Beginner)
+
+- **Trigger:** a client command (`kubectl create/apply`) emits one HTTP request.
+- **First durable state change:** nothing is "real" until the storage layer writes to etcd.
+- **Security gates run before business logic:** authentication/authorization/admission can reject before the resource handler is reached.
+- **Success criterion for this scenario:** object bytes are persisted under `/registry/...` and visible via GET/list/watch.
+- **Most common confusion:** HTTP `201 Created` means persistence success, not workload readiness.
+
+## Overall Flow Diagram
 
 ```
 kubectl create -f pod.yaml
@@ -10,13 +42,13 @@ kubectl create -f pod.yaml
 [1] cmd/kubectl/kubectl.go:main()
         │
 [2] staging/.../kubectl/pkg/cmd/cmd.go:NewDefaultKubectlCommand()
-        │ cobra Command 생성 + kubeconfig 로드
+        │ Create cobra Command + load kubeconfig
         │
 [3] staging/.../client-go/rest/request.go:NewRequest()
-        │ HTTP 요청 객체 구성
+        │ Build the HTTP request object
         │
 [4] staging/.../client-go/rest/request.go:request()
-        │ rate limit → retry → HTTP 전송
+        │ rate limit → retry → HTTP send
         │
         │ HTTPS POST /api/v1/namespaces/default/pods
         ▼
@@ -24,16 +56,16 @@ kubectl create -f pod.yaml
         │ CreateServerChain()
         │
 [6] staging/.../apiserver/pkg/server/config.go:DefaultBuildHandlerChain()
-        │ 필터 체인 (인증 → 인가 → Admission → 핸들러)
+        │ Filter chain (authentication → authorization → admission → handler)
         │
 [7] staging/.../apiserver/pkg/endpoints/handlers/create.go:createHandler()
-        │ 역직렬화 → Admission → Storage.Create()
+        │ Deserialization → Admission → Storage.Create()
         │
 [8] staging/.../apiserver/pkg/registry/generic/registry/store.go:Store.Create()
-        │ BeforeCreate → Validation → etcd key 생성
+        │ BeforeCreate → Validation → etcd key generation
         │
 [9] staging/.../apiserver/pkg/storage/etcd3/store.go:store.Create()
-        │ Codec 직렬화 → 암호화 → etcd PUT
+        │ Codec serialization → encryption → etcd PUT
         │
         ▼
      etcd: /registry/pods/default/my-pod = {protobuf}
@@ -41,14 +73,14 @@ kubectl create -f pod.yaml
 
 ---
 
-## 단계별 상세 분석
+## Step-by-Step Analysis
 
-### [1] kubectl 진입점
+### [1] kubectl Entry Point
 
-**파일:** [cmd/kubectl/kubectl.go](../cmd/kubectl/kubectl.go#L31)
+**File:** [cmd/kubectl/kubectl.go](../cmd/kubectl/kubectl.go#L31)
 
 ```go
-// 라인 31-44
+// Lines 31-44
 func main() {
     logs.GlogSetter(cmd.GetLogVerbosity(os.Args))
     command := cmd.NewDefaultKubectlCommand()
@@ -58,12 +90,12 @@ func main() {
 }
 ```
 
-### [2] Cobra 명령 구성
+### [2] Cobra Command Construction
 
-**파일:** [staging/src/k8s.io/kubectl/pkg/cmd/cmd.go](../staging/src/k8s.io/kubectl/pkg/cmd/cmd.go#L96)
+**File:** [staging/src/k8s.io/kubectl/pkg/cmd/cmd.go](../staging/src/k8s.io/kubectl/pkg/cmd/cmd.go#L96)
 
 ```go
-// 라인 96-104
+// Lines 96-104
 func NewDefaultKubectlCommand() *cobra.Command {
     ioStreams := genericiooptions.IOStreams{In: os.Stdin, Out: os.Stdout, ErrOut: os.Stderr}
     return NewDefaultKubectlCommandWithArgs(KubectlOptions{
@@ -75,19 +107,19 @@ func NewDefaultKubectlCommand() *cobra.Command {
 }
 ```
 
-**핵심 역할:**
-- `ConfigFlags`: `~/.kube/config`에서 인증 정보 로드
-- `PluginHandler`: `kubectl-*` 플러그인 바이너리 처리
+**Key responsibilities:**
+- `ConfigFlags`: loads credentials from `~/.kube/config`
+- `PluginHandler`: handles `kubectl-*` plugin binaries
 
-### [3] HTTP 요청 객체 생성
+### [3] HTTP Request Object Creation
 
-**파일:** [staging/src/k8s.io/client-go/rest/request.go](../staging/src/k8s.io/client-go/rest/request.go#L133)
+**File:** [staging/src/k8s.io/client-go/rest/request.go](../staging/src/k8s.io/client-go/rest/request.go#L133)
 
 ```go
-// 라인 133-176: NewRequest()
+// Lines 133-176: NewRequest()
 r := &Request{
     c:           c,
-    rateLimiter: c.rateLimiter,   // 요청 속도 제한
+    rateLimiter: c.rateLimiter,   // request rate limiting
     timeout:     timeout,
     pathPrefix:  path.Join("/", c.base.Path, c.versionedAPIPath),
     maxRetries:  10,
@@ -95,31 +127,31 @@ r := &Request{
 }
 ```
 
-**URL 구성 예시:**
+**Example URL construction:**
 ```
 https://192.168.0.1:6443/api/v1/namespaces/default/pods
 ```
 
-### [4] HTTP 전송 로직
+### [4] HTTP Send Logic
 
-**파일:** [staging/src/k8s.io/client-go/rest/request.go](../staging/src/k8s.io/client-go/rest/request.go#L1030)
+**File:** [staging/src/k8s.io/client-go/rest/request.go](../staging/src/k8s.io/client-go/rest/request.go#L1030)
 
 ```go
-// 라인 1030-1121: request()
+// Lines 1030-1121: request()
 func (r *Request) request(ctx context.Context, fn func(*http.Request, *http.Response)) error {
     // 1. Rate limiting
     if err := r.tryThrottle(ctx); err != nil { return err }
 
-    // 2. Timeout 설정
+    // 2. Set timeout
     if r.timeout > 0 {
         ctx, cancel = context.WithTimeout(ctx, r.timeout)
     }
 
-    // 3. 재시도 루프
+    // 3. Retry loop
     retry := r.retryFn(r.maxRetries)
     for {
-        req, err := r.newHTTPRequest(ctx)  // 라인 980: HTTP Request 생성
-        resp, err := client.Do(req)         // 라인 1088: 실제 전송
+        req, err := r.newHTTPRequest(ctx)  // Line 980: create the HTTP request
+        resp, err := client.Do(req)         // Line 1088: actual send
         if retry.IsNextRetry(...) { continue }
         fn(req, resp)
         return nil
@@ -127,123 +159,123 @@ func (r *Request) request(ctx context.Context, fn func(*http.Request, *http.Resp
 }
 ```
 
-**데이터 변환:**
+**Data transformation:**
 ```
 pod.yaml (YAML)
-    → JSON (kubectl이 Content-Type: application/json으로 전송)
+    → JSON (kubectl sends with Content-Type: application/json)
     → HTTP Body
 ```
 
 ---
 
-### [5] kube-apiserver 시작 및 서버 체인
+### [5] kube-apiserver Startup and Server Chain
 
-**파일:** [cmd/kube-apiserver/app/server.go](../cmd/kube-apiserver/app/server.go#L148)
+**File:** [cmd/kube-apiserver/app/server.go](../cmd/kube-apiserver/app/server.go#L148)
 
 ```go
-// 라인 148-173: Run()
+// Lines 148-173: Run()
 func Run(ctx context.Context, opts options.CompletedOptions) error {
     config, err := NewConfig(opts)
     completed, err := config.Complete()
 
-    // 라인 162: 3-tier 서버 체인 생성
+    // Line 162: create the 3-tier server chain
     server, err := CreateServerChain(completed)
-    //  └─ APIExtensionsServer (CRD 처리)
-    //      └─ KubeAPIServer (Pod, Service, Node 등 코어 API)
-    //          └─ AggregatorServer (외부 API 서버 통합)
+    //  └─ APIExtensionsServer (handles CRDs)
+    //      └─ KubeAPIServer (core APIs: Pod, Service, Node, etc.)
+    //          └─ AggregatorServer (integrates external API servers)
 
     prepared, err := server.PrepareRun()
-    return prepared.Run(ctx)  // HTTPS 리스너 시작
+    return prepared.Run(ctx)  // start the HTTPS listener
 }
 ```
 
-### [6] Handler 필터 체인
+### [6] Handler Filter Chain
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/server/config.go](../staging/src/k8s.io/apiserver/pkg/server/config.go#L1036)
+**File:** [staging/src/k8s.io/apiserver/pkg/server/config.go](../staging/src/k8s.io/apiserver/pkg/server/config.go#L1036)
 
 ```
-DefaultBuildHandlerChain() 라인 1036-1116 — 체인 적용 순서 (안→밖):
+DefaultBuildHandlerChain() lines 1036-1116 — chain application order (inner→outer):
 
-APIHandler (실제 처리)
-    ← WithAuthorization          (라인 1040) ← RBAC 권한 확인
-    ← WithImpersonation          (라인 1056) ← 사용자 위장
-    ← WithAudit                  (라인 1064) ← 감시 로깅
-    ← WithAuthentication         (라인 1075) ← 인증
-    ← WithCORS                   (라인 1078)
-    ← WithTimeoutForNonLongRunning (라인 1086)
-    ← WithRequestDeadline        (라인 1088)
-    ← WithWaitGroup              (라인 1090)
-    ← WithPriorityAndFairness    (라인 1051) ← 요청 우선순위/공정성
-    ← WithHTTPLogging            (라인 1102)
-    ← WithRequestInfo            (라인 1110) ← 요청 메타데이터 추출
-    ← WithPanicRecovery          (라인 1113)
-    ← WithAuditInit              (라인 1114)
+APIHandler (actual processing)
+    ← WithAuthorization          (line 1040) ← RBAC permission check
+    ← WithImpersonation          (line 1056) ← user impersonation
+    ← WithAudit                  (line 1064) ← audit logging
+    ← WithAuthentication         (line 1075) ← authentication
+    ← WithCORS                   (line 1078)
+    ← WithTimeoutForNonLongRunning (line 1086)
+    ← WithRequestDeadline        (line 1088)
+    ← WithWaitGroup              (line 1090)
+    ← WithPriorityAndFairness    (line 1051) ← request priority/fairness
+    ← WithHTTPLogging            (line 1102)
+    ← WithRequestInfo            (line 1110) ← request metadata extraction
+    ← WithPanicRecovery          (line 1113)
+    ← WithAuditInit              (line 1114)
 ```
 
-**인증 필터:**
+**Authentication filter:**
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go#L46)
+**File:** [staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go#L46)
 
 ```go
-// 라인 46-125: WithAuthentication()
-resp, ok, err := auth.AuthenticateRequest(req)  // 라인 67: 인증 체인 실행
+// Lines 46-125: WithAuthentication()
+resp, ok, err := auth.AuthenticateRequest(req)  // Line 67: run the authentication chain
 
-// 인증 성공 시
-req.Header.Del("Authorization")                  // 라인 89: 토큰 제거
+// On successful authentication
+req.Header.Del("Authorization")                  // Line 89: remove the token
 req = req.WithContext(
-    genericapirequest.WithUser(req.Context(), resp.User))  // 라인 122: 사용자 정보 주입
+    genericapirequest.WithUser(req.Context(), resp.User))  // Line 122: inject user info
 ```
 
-**인가 필터:**
+**Authorization filter:**
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go#L55)
+**File:** [staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go#L55)
 
 ```go
-// 라인 55-97: withAuthorization()
-attributes, err := GetAuthorizerAttributes(ctx)        // 라인 64: 요청 속성 추출
-authorized, reason, err := a.Authorize(ctx, attributes) // 라인 69: 권한 확인
+// Lines 55-97: withAuthorization()
+attributes, err := GetAuthorizerAttributes(ctx)        // Line 64: extract request attributes
+authorized, reason, err := a.Authorize(ctx, attributes) // Line 69: permission check
 
 if authorized == authorizer.DecisionAllow {
-    handler.ServeHTTP(w, req)  // 라인 82: 허용 → 다음 핸들러
+    handler.ServeHTTP(w, req)  // Line 82: allowed → next handler
     return
 }
-responsewriters.Forbidden(...)  // 라인 91: 403 Forbidden
+responsewriters.Forbidden(...)  // Line 91: 403 Forbidden
 ```
 
-### [7] Create 요청 핸들러
+### [7] Create Request Handler
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go](../staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go#L53)
+**File:** [staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go](../staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go#L53)
 
 ```go
-// 라인 53-250+: createHandler()
+// Lines 53-250+: createHandler()
 func createHandler(r rest.NamedCreater, scope *RequestScope, admit admission.Interface, ...) http.HandlerFunc {
     return func(w http.ResponseWriter, req *http.Request) {
 
-        // 1. 입력 미디어 타입 협상 (라인 88)
+        // 1. Negotiate input media type (line 88)
         s, err := negotiation.NegotiateInputSerializer(req, false, scope.Serializer)
 
-        // 2. 요청 바디 읽기 (라인 94)
+        // 2. Read the request body (line 94)
         body, err := limitedReadBodyWithRecordMetric(ctx, req, scope.MaxRequestBodyBytes, ...)
 
-        // 3. 역직렬화: body → runtime.Object (라인 129)
+        // 3. Deserialize: body → runtime.Object (line 129)
         obj, gvk, err := decoder.Decode(body, &defaultGVK, original)
 
-        // 4. Audit 로깅 (라인 160)
+        // 4. Audit logging (line 160)
         audit.LogRequestObject(req.Context(), obj, objGV, scope.Resource, ...)
 
-        // 5. Admission 속성 생성 (라인 182)
+        // 5. Create admission attributes (line 182)
         admissionAttributes := admission.NewAttributesRecord(
             obj, nil, scope.Kind, namespace, name,
             scope.Resource, scope.Subresource, admission.Create, options, ...)
 
-        // 6. Storage에 저장 (라인 183)
+        // 6. Persist to storage (line 183)
         requestFunc := func() (runtime.Object, error) {
             return r.Create(ctx, name, obj,
                 rest.AdmissionToValidateObjectFunc(admit, admissionAttributes, scope),
                 options)
         }
 
-        // 7. Managed Fields + Admission (라인 194)
+        // 7. Managed Fields + Admission (line 194)
         result, err := finisher.FinishRequest(ctx, func() (runtime.Object, error) {
             obj = scope.FieldManager.UpdateNoErrors(liveObj, obj, ...)
             return requestFunc()
@@ -252,97 +284,115 @@ func createHandler(r rest.NamedCreater, scope *RequestScope, admit admission.Int
 }
 ```
 
-**Admission 실행 순서:**
+> ⚠️ **Where does `r.Create` actually go?** The handler receives `r rest.NamedCreater` ([rest.go:212](../staging/src/k8s.io/apiserver/pkg/registry/rest/rest.go#L212)) — an interface, so the concrete storage is invisible here. Trace it: most resources are backed by the generic `genericregistry.Store` ([store.go:101](../staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go#L101)), proven to satisfy the REST interfaces by `var _ rest.StandardStorage = &Store{}` ([store.go:253](../staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go#L253)). Each resource wraps it in a thin `*REST` — e.g. the Pod `REST` embeds `*genericregistry.Store` ([pkg/registry/core/pod/storage/storage.go:70](../pkg/registry/core/pod/storage/storage.go#L70)). That `*REST` is registered into the per-resource storage map at route-build time, so `r.Create(...)` dispatches to `(*Store).Create` → `store.create()` (Step [8]).
+
+**Admission execution order:**
 ```
-Mutating Webhooks (객체 수정 가능)
-    → Validating Webhooks (검증만)
-    → 내장 플러그인: ServiceAccount, LimitRanger, ResourceQuota, ...
+Mutating Webhooks (may modify the object)
+    → Validating Webhooks (validation only)
+    → Built-in plugins: ServiceAccount, LimitRanger, ResourceQuota, ...
 ```
 
 ### [8] Storage Layer — Store.Create()
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go](../staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go#L454)
+**File:** [staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go](../staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go#L454)
 
 ```go
-// 라인 485-566: store.create()
+// Lines 485-566: store.create()
 func (e *Store) create(ctx context.Context, obj runtime.Object, ...) (runtime.Object, error) {
 
-    // 1. 메타데이터 초기화 (라인 489)
-    rest.FillObjectMetaSystemFields(objectMeta)  // UID, CreationTimestamp 설정
+    // 1. Initialize metadata (line 489)
+    rest.FillObjectMetaSystemFields(objectMeta)  // set UID, CreationTimestamp
 
-    // 2. GenerateName 처리 (라인 494)
+    // 2. Handle GenerateName (line 494)
     objectMeta.SetName(e.CreateStrategy.GenerateName(objectMeta.GetGenerateName()))
 
-    // 3. BeforeCreate 훅 (라인 509)
+    // 3. BeforeCreate hook (line 509)
     rest.BeforeCreate(e.CreateStrategy, ctx, obj)
 
-    // 4. Validation 실행 (라인 514)
+    // 4. Run validation (line 514)
     createValidation(ctx, obj.DeepCopyObject())
 
-    // 5. etcd 키 생성 (라인 524)
+    // 5. Generate the etcd key (line 524)
     key, err := e.KeyFunc(ctx, name)
-    // 예: "/registry/pods/default/my-pod"
+    // e.g.: "/registry/pods/default/my-pod"
 
-    // 6. etcd 저장 (라인 534) ← 핵심
+    // 6. Persist to etcd (line 534) ← the crux
     e.Storage.Create(ctx, key, obj, out, ttl, dryrun.IsDryRun(options.DryRun))
 }
 ```
 
-### [9] etcd3 직접 저장
+### [9] Direct etcd3 Persistence
 
-**파일:** [staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go](../staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go#L269)
+**File:** [staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go](../staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go#L269)
 
 ```go
-// 라인 269-334: store.Create()
+// Lines 269-334: store.Create()
 func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
 
-    // 1. Protobuf 직렬화 (라인 289)
+    // 1. Protobuf serialization (line 289)
     data, err := runtime.Encode(s.codec, obj)
 
-    // 2. encryption-at-rest 암호화 (라인 304)
+    // 2. encryption-at-rest encryption (line 304)
     newData, err := s.transformer.TransformToStorage(ctx, data, authenticatedDataString(preparedKey))
 
-    // 3. etcd 원자적 PUT (라인 311) ← 최종 저장
+    // 3. Atomic etcd PUT (line 311) ← final persistence
     txnResp, err := s.client.Kubernetes.OptimisticPut(
         ctx, preparedKey, newData, 0, kubernetes.PutOptions{LeaseID: lease})
 
-    // 4. 저장된 데이터 역직렬화하여 반환 (라인 324)
+    // 4. Decode the stored data and return it (line 324)
     s.decoder.Decode(data, out, txnResp.Revision)
 }
 ```
 
-**데이터 변환 전체 흐름:**
+**Full data transformation flow:**
 ```
-YAML 파일
-  → JSON (kubectl 직렬화)
-  → runtime.Object (apiserver 역직렬화)
-  → Admission (수정 가능)
-  → Protobuf (etcd 저장용 codec)
-  → 암호화 (encryption-at-rest, 선택적)
-  → etcd 저장
+YAML file
+  → JSON (kubectl serialization)
+  → runtime.Object (apiserver deserialization)
+  → Admission (may modify)
+  → Protobuf (codec for etcd storage)
+  → Encryption (encryption-at-rest, optional)
+  → etcd persistence
 ```
 
 ---
 
-## 핵심 파일 경로 요약
+## Key File Path Summary
 
-| 단계 | 파일 | 핵심 함수 | 라인 |
+| Step | File | Key Function | Line |
 |------|------|----------|------|
-| 1. CLI 진입 | [cmd/kubectl/kubectl.go](../cmd/kubectl/kubectl.go) | `main` | 31 |
-| 2. 명령 구성 | [staging/.../kubectl/pkg/cmd/cmd.go](../staging/src/k8s.io/kubectl/pkg/cmd/cmd.go) | `NewDefaultKubectlCommand` | 96 |
-| 3. 요청 객체 | [staging/.../client-go/rest/request.go](../staging/src/k8s.io/client-go/rest/request.go) | `NewRequest` | 133 |
-| 4. HTTP 전송 | [staging/.../client-go/rest/request.go](../staging/src/k8s.io/client-go/rest/request.go) | `request` | 1030 |
-| 5. 서버 시작 | [cmd/kube-apiserver/app/server.go](../cmd/kube-apiserver/app/server.go) | `Run` | 148 |
-| 6. 필터 체인 | [staging/.../apiserver/pkg/server/config.go](../staging/src/k8s.io/apiserver/pkg/server/config.go) | `DefaultBuildHandlerChain` | 1036 |
-| 6a. 인증 | [staging/.../filters/authentication.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go) | `WithAuthentication` | 46 |
-| 6b. 인가 | [staging/.../filters/authorization.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go) | `WithAuthorization` | 51 |
-| 7. CREATE 핸들러 | [staging/.../handlers/create.go](../staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go) | `createHandler` | 53 |
+| 1. CLI entry | [cmd/kubectl/kubectl.go](../cmd/kubectl/kubectl.go) | `main` | 31 |
+| 2. Command construction | [staging/.../kubectl/pkg/cmd/cmd.go](../staging/src/k8s.io/kubectl/pkg/cmd/cmd.go) | `NewDefaultKubectlCommand` | 96 |
+| 3. Request object | [staging/.../client-go/rest/request.go](../staging/src/k8s.io/client-go/rest/request.go) | `NewRequest` | 133 |
+| 4. HTTP send | [staging/.../client-go/rest/request.go](../staging/src/k8s.io/client-go/rest/request.go) | `request` | 1030 |
+| 5. Server startup | [cmd/kube-apiserver/app/server.go](../cmd/kube-apiserver/app/server.go) | `Run` | 148 |
+| 6. Filter chain | [staging/.../apiserver/pkg/server/config.go](../staging/src/k8s.io/apiserver/pkg/server/config.go) | `DefaultBuildHandlerChain` | 1036 |
+| 6a. Authentication | [staging/.../filters/authentication.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authentication.go) | `WithAuthentication` | 46 |
+| 6b. Authorization | [staging/.../filters/authorization.go](../staging/src/k8s.io/apiserver/pkg/endpoints/filters/authorization.go) | `WithAuthorization` | 51 |
+| 7. CREATE handler | [staging/.../handlers/create.go](../staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go) | `createHandler` | 53 |
 | 8. Store | [staging/.../registry/store.go](../staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go) | `Store.Create` | 454 |
 | 9. etcd | [staging/.../storage/etcd3/store.go](../staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go) | `store.Create` | 269 |
 
 ---
 
-## 관련 시나리오
+## Related Concepts
 
-- [시나리오 2: Pod 스케줄링](02-pod-scheduling.md) — 저장된 Pod를 스케줄러가 감지하는 흐름
-- [시나리오 6: 인증/인가 상세](06-auth-flow.md) — 인증/인가 체인 상세 분석
+Background ideas this scenario assumes. Skim them if a step felt like it skipped a "why".
+
+- **Declarative API & desired state.** A Kubernetes object records *desired* state in `spec`; controllers later reconcile *actual* state (`status`) toward it. A successful create therefore just durably records intent — no Pod runs yet.
+- **Resources vs. kinds (GVR vs. GVK).** The URL path maps to a Group/Version/**Resource** (`apps/v1/deployments`), while the body carries a Group/Version/**Kind** (`apps/v1`, `Deployment`). The RESTMapper converts between them — which is why both `pods` (resource) and `Pod` (kind) exist.
+- **Internal vs. external versions & conversion.** Incoming bytes decode into a versioned *external* type, convert to a single *internal* type for processing, then convert back out on read. This is what lets one server serve `v1beta1` and `v1` of the same object.
+- **Content negotiation & codecs.** Clients send JSON/YAML and pick a response format via `Accept`; etcd stores Protobuf. The codec factory drives encode/decode at every boundary.
+- **Optimistic concurrency (`resourceVersion`).** Every write carries the version it read; a stale write fails with HTTP 409 Conflict instead of silently overwriting. This is the foundation of `kubectl apply` and controller retry loops.
+- **Encryption at rest (transformers).** An optional transformer encrypts the serialized object just before the etcd write and decrypts on read, configured via `EncryptionConfiguration` (aescbc/KMS).
+- **Watch & informers.** After this scenario stores the object, schedulers, controllers, and kubelets learn about it through a list+watch stream keyed on `resourceVersion` — the mechanism every later scenario depends on.
+
+> ⚠️ **A `201 Created` does not mean anything is running.** This flow ends at "bytes durably in etcd." The Pod/Deployment only becomes real when the matching controller (Scenario 2/3) and kubelet (Scenario 4) observe it via watch and act.
+
+---
+
+## Related Scenarios
+
+- [Scenario 2: Pod Scheduling](02-pod-scheduling.md) — how the scheduler detects the persisted Pod
+- [Scenario 6: Authentication/Authorization Details](06-auth-flow.md) — detailed analysis of the authentication/authorization chain
